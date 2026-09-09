@@ -1,0 +1,11 @@
+# Build artifacts
+/target
+
+# Convenience copy of the release binary (kept locally for double-click use)
+/dsh-launcher.exe
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

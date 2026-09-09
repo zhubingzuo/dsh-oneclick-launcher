@@ -1,0 +1,19 @@
+[package]
+name = "dsh-launcher"
+version = "1.0.0"
+edition = "2021"
+description = "One-click launcher for DeepSeek Harness: starts `npx @deepseek-ai/dsh web`, opens a clean Chrome window at http://127.0.0.1:3080/, no console window."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/zhubingzuo/dsh-oneclick-launcher"
+keywords = ["deepseek", "harness", "dsh", "launcher", "windows"]
+categories = ["command-line-utilities"]
+build = "build.rs"
+
+# Intentionally zero external dependencies: the sandbox/offline environment
+# cannot download crates, and the Win32 surface we need is tiny.
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
