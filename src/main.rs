@@ -35,6 +35,10 @@ const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9; // JobObjectExtendedLimitInformation
 const ERROR_ALREADY_EXISTS: u32 = 183;
 
+// How long to keep waiting, after the port already accepts connections, for
+// `dsh web` to print its tokenized URL on stdout.
+const LAUNCH_URL_GRACE: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // minimal Win32 FFI (no external crates)
 // ---------------------------------------------------------------------------
@@ -100,6 +104,7 @@ struct JobObjectExtendedLimitInformation {
     basic_limit_information: JobObjectBasicLimitInformation,
     io_info: IoCounters,
     process_memory_limit: usize,
+    job_memory_limit: usize,
     peak_process_memory_used: usize,
     peak_job_memory_used: usize,
 }
@@ -185,6 +190,41 @@ fn read_tail(path: &Path, max_bytes: usize) -> String {
 // ---------------------------------------------------------------------------
 // environment helpers
 // ---------------------------------------------------------------------------
+
+/// The tokenized URL `dsh web` prints on stdout. This is the only place its
+/// per-process launch token can be read from: the token lives in an in-memory
+/// weak map inside that node process and is never written to disk, and the bare
+/// URL is rejected (401) unless a `dsh-auth-*` cookie was already minted from
+/// it. Scanning only bytes appended after `from_offset` keeps a stale token from
+/// a previous run from being reused.
+fn find_launch_url(from_offset: u64) -> Option<String> {
+    const PREFIX: &str = "http://127.0.0.1:";
+    const TOKEN_SUFFIX: &str = "/?token=";
+    let bytes = fs::read(server_log_path()).ok()?;
+    let start = (from_offset as usize).min(bytes.len());
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    for line in text.lines() {
+        let Some(at) = line.find(PREFIX) else { continue };
+        let rest = &line[at..];
+        let Some(token_at) = rest.find(TOKEN_SUFFIX) else { continue };
+        let digits = &rest[PREFIX.len()..token_at];
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let url = rest.split_whitespace().next().unwrap_or_default();
+        if url.len() > token_at + TOKEN_SUFFIX.len() {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
+/// Port of an `http://127.0.0.1:<port>/...` URL. Readiness has to be checked on
+/// whichever port dsh actually bound, which is only known from its URL when it
+/// was allowed to pick one itself (`--port 0`).
+fn url_port(url: &str) -> Option<u16> {
+    url.strip_prefix("http://127.0.0.1:")?.split('/').next()?.parse().ok()
+}
 
 fn port_from_env() -> u16 {
     env::var("DSH_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_PORT)
@@ -323,9 +363,14 @@ fn spawn_hidden(args: &[String]) -> std::io::Result<Child> {
 // server
 // ---------------------------------------------------------------------------
 
-fn start_server(job: Option<&KillJob>) -> std::io::Result<Child> {
+/// Starts the server and also returns the length `server.log` had before the
+/// spawn, so the launch URL can be searched for in this run's output only.
+/// `port` is the port to ask dsh for, or `None` to let the OS pick a free one
+/// (`--port 0`).
+fn start_server(job: Option<&KillJob>, port: Option<u16>) -> std::io::Result<(Child, u64)> {
     let server_log = server_log_path();
     ensure_dir(server_log.parent().unwrap_or(Path::new(".")));
+    let log_from = fs::metadata(&server_log).map(|m| m.len()).unwrap_or(0);
     let out = OpenOptions::new().create(true).append(true).open(&server_log)?;
     let err = out.try_clone()?;
 
@@ -347,6 +392,11 @@ fn start_server(job: Option<&KillJob>) -> std::io::Result<Child> {
             .iter()
             .map(|s| s.to_string())
             .collect();
+        // Ask for the port explicitly: the port the launcher probes (and the one
+        // the browser is sent to) must be the one dsh actually binds. Without
+        // this, DSH_PORT only moved the probe and not the server.
+        args.push("--port".to_string());
+        args.push(port.map_or_else(|| "0".to_string(), |p| p.to_string()));
     }
 
     let mut cmd = Command::new("cmd.exe");
@@ -360,14 +410,14 @@ fn start_server(job: Option<&KillJob>) -> std::io::Result<Child> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    log_msg(&format!("server command: cmd /C {}", args.join(" ")));
+    log_msg(&format!("server command: cmd {}", args.join(" ")));
 
     let child = cmd.spawn()?;
     log_msg(&format!("server child spawned (pid {}), waiting for the port", child.id()));
     if let Some(j) = job {
         j.assign(&child);
     }
-    Ok(child)
+    Ok((child, log_from))
 }
 
 enum WaitReady {
@@ -376,11 +426,27 @@ enum WaitReady {
     Timeout,
 }
 
-fn wait_ready(mut server: Option<&mut Child>, port: u16) -> WaitReady {
+/// `probe_port` is the port that was asked for, or `None` when dsh picks one
+/// itself — in that case its tokenized URL is the only readiness signal.
+fn wait_ready(mut server: Option<&mut Child>, probe_port: Option<u16>, log_from: u64) -> WaitReady {
     let deadline = Instant::now() + ready_timeout();
+    let mut port_open_since: Option<Instant> = None;
     loop {
-        if port_open(port) {
-            return WaitReady::Ready;
+        if let Some(url) = find_launch_url(log_from) {
+            if url_port(&url).is_none_or(port_open) {
+                return WaitReady::Ready;
+            }
+        }
+        if let Some(port) = probe_port {
+            if port_open(port) {
+                // A dsh without token auth never prints that URL; do not wait
+                // for it forever.
+                let since = *port_open_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= LAUNCH_URL_GRACE {
+                    log_msg("no tokenized launch URL in server output; using the bare URL");
+                    return WaitReady::Ready;
+                }
+            }
         }
         if let Some(c) = server.as_deref_mut() {
             if let Some(st) = c.try_wait().unwrap_or(None) {
@@ -519,70 +585,74 @@ fn run() -> i32 {
         return 0;
     };
 
-    let port = port_from_env();
-    let url = url_for(port);
-    let already_running = port_open(port);
-    log_msg(&format!("port {port} already in use: {already_running}"));
+    let wanted_port = port_from_env();
+    // A dsh already listening on the wanted port cannot be reused: every UI
+    // request is authenticated with a token that exists only inside that node
+    // process and is never persisted, so there is no way to drive it. Start our
+    // own dsh web on an OS-picked free port instead, and leave that one alone.
+    let port_busy = port_open(wanted_port);
+    let bind_port = if port_busy { None } else { Some(wanted_port) };
+    let url: String;
+    log_msg(&format!(
+        "port {wanted_port} already in use: {port_busy}{}",
+        if port_busy { " — starting our own dsh web on a free port" } else { "" }
+    ));
 
-    let mut server: Option<Child> = None;
-    let mut job: Option<KillJob> = None;
-    let mut server_pid: Option<u32> = None;
-
-    if !already_running {
-        // The job object is an extra safety net for abrupt termination
-        // (e.g. the launcher itself is killed). Normal shutdown always uses
-        // taskkill below, so job creation is best-effort and optional.
-        let j = KillJob::create();
-        match start_server(j.as_ref()) {
-            Ok(c) => {
-                server_pid = Some(c.id());
-                job = j;
-                server = Some(c);
-            }
-            Err(e) => {
-                log_msg(&format!("failed to spawn server: {e}"));
-                show_message(
-                    "DSH 启动器",
-                    &format!(
-                        "无法启动 npx @deepseek-ai/dsh web:\n{e}\n\n请确认已安装 Node.js 并已加入 PATH。\n\n日志:{}\n服务输出:{}\n",
-                        log_path().display(),
-                        server_log_path().display()
-                    ),
-                );
-                return 1;
-            }
+    // The job object is an extra safety net for abrupt termination (e.g. the
+    // launcher itself is killed). Normal shutdown always uses taskkill below,
+    // so job creation is best-effort and optional.
+    let job = KillJob::create();
+    let (server_child, server_log_from) = match start_server(job.as_ref(), bind_port) {
+        Ok((c, log_from)) => (c, log_from),
+        Err(e) => {
+            log_msg(&format!("failed to spawn server: {e}"));
+            show_message(
+                "DSH 启动器",
+                &format!(
+                    "无法启动 npx @deepseek-ai/dsh web:\n{e}\n\n请确认已安装 Node.js 并已加入 PATH。\n\n日志:{}\n服务输出:{}\n",
+                    log_path().display(),
+                    server_log_path().display()
+                ),
+            );
+            return 1;
         }
+    };
+    let server_pid = server_child.id();
+    let mut server = Some(server_child);
 
-        match wait_ready(server.as_mut(), port) {
-            WaitReady::Ready => log_msg("server ready"),
-            WaitReady::ServerExited(st) => {
-                log_msg(&format!("server exited early with {st}"));
-                show_message(
-                    "DSH 启动器",
-                    &format!(
-                        "dsh web 未能启动(进程已退出:{st})。\n\n最近的输出:\n{}\n\n完整日志:{}\n\n建议:打开一个终端手动运行:\nnpx @deepseek-ai/dsh web\n以查看详细错误。",
-                        read_tail(&server_log_path(), 2000),
-                        server_log_path().display()
-                    ),
-                );
-                return 1;
-            }
-            WaitReady::Timeout => {
-                log_msg("server did not become ready in time");
-                show_message(
-                    "DSH 启动器",
-                    &format!(
-                        "等待 dsh web 就绪超时({} 秒)。\n\n最近的输出:\n{}\n\n完整日志:{}\n\n建议:打开一个终端手动运行:\nnpx @deepseek-ai/dsh web\n以查看详细错误。",
-                        ready_timeout().as_secs(),
-                        read_tail(&server_log_path(), 2000),
-                        server_log_path().display()
-                    ),
-                );
-                return 1;
-            }
+    match wait_ready(server.as_mut(), bind_port, server_log_from) {
+        WaitReady::Ready => {
+            // The URL carries this process's launch token; without it dsh rejects
+            // the request (401) and the browser shows an error page instead of
+            // the UI.
+            url = find_launch_url(server_log_from).unwrap_or_else(|| url_for(wanted_port));
+            log_msg(&format!("server ready: {url}"));
         }
-    } else {
-        log_msg("server already listening — leaving it untouched");
+        WaitReady::ServerExited(st) => {
+            log_msg(&format!("server exited early with {st}"));
+            show_message(
+                "DSH 启动器",
+                &format!(
+                    "dsh web 未能启动(进程已退出:{st})。\n\n最近的输出:\n{}\n\n完整日志:{}\n\n建议:打开一个终端手动运行:\nnpx @deepseek-ai/dsh web\n以查看详细错误。",
+                    read_tail(&server_log_path(), 2000),
+                    server_log_path().display()
+                ),
+            );
+            return 1;
+        }
+        WaitReady::Timeout => {
+            log_msg("server did not become ready in time");
+            show_message(
+                "DSH 启动器",
+                &format!(
+                    "等待 dsh web 就绪超时({} 秒)。\n\n最近的输出:\n{}\n\n完整日志:{}\n\n建议:打开一个终端手动运行:\nnpx @deepseek-ai/dsh web\n以查看详细错误。",
+                    ready_timeout().as_secs(),
+                    read_tail(&server_log_path(), 2000),
+                    server_log_path().display()
+                ),
+            );
+            return 1;
+        }
     }
 
     let profile = fresh_profile_dir();
@@ -621,16 +691,12 @@ fn run() -> i32 {
         }
     }
 
-    if !already_running {
-        if let Some(pid) = server_pid {
-            log_msg(&format!("stopping server tree (pid {pid})"));
-            kill_tree(pid);
-        }
-        drop(job); // kill-on-close terminates anything still in the job
-        if let Some(mut s) = server {
-            let _ = s.kill();
-            let _ = s.wait();
-        }
+    log_msg(&format!("stopping server tree (pid {server_pid})"));
+    kill_tree(server_pid);
+    drop(job); // kill-on-close terminates anything still in the job
+    if let Some(mut s) = server {
+        let _ = s.kill();
+        let _ = s.wait();
     }
 
     cleanup_profile(&profile);
