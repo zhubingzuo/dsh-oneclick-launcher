@@ -36,9 +36,10 @@
 `ui_marker`**(默认 `DeepSeek Harness`)才复用;需令牌、非 HTTP、或不像 DSH 都改用 `--port 0` 另起自己的
 实例 → 按"完整命令 → 命令 + 空闲端口 → 仅命令"依次尝试(`cmd.exe` + `raw_arg` 原样传命令行,避免
 Rust 把引号转义成 `\"`;失败立即换下一档) → `wait_ready`(解析 dsh 打印的带 token URL;**端口先通
-不是失败**,裸地址只在真能 200/303 时才被接受,否则一直等到超时)→ 用独立临时 profile 开 Chrome →
-等窗口关闭 → 只结束自己启动的服务(先 `try_wait` 确认它还活着再 `taskkill /T`,另有 Job Object
-`KILL_ON_JOB_CLOSE` 兜底)→ 删临时 profile → 退出。
+不是失败**,裸地址只在真能 200/303 时才被接受,否则一直等到超时)→ 用独立临时 profile 按 `window_mode`
+开 Chrome(默认 `--app=<url>` 应用窗口;`normal` 为普通窗口)→ 等窗口关闭 → 只结束自己启动的服务
+(先 `try_wait` 确认它还活着再 `taskkill /T`,另有 Job Object `KILL_ON_JOB_CLOSE` 兜底)→ 删临时
+profile → 退出。
 
 运行期数据:`%LOCALAPPDATA%\dsh-launcher\` —— `launcher.log` 是本程序日志,`server.log` 是 dsh
 子进程的 stdout+stderr 合并。
@@ -91,12 +92,13 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
   专门盯这条。
 - **配置文件模板只写 ASCII**:用户会用记事本编辑 `dsh-launcher.conf`,若模板含中文注释而用户另存为
   ANSI,就得靠 `String::from_utf8_lossy` + 去 BOM 兜底(已实现)。新增模板文字请保持 ASCII。
-- **地址栏的"安装"图标源自 DSH 自带的 manifest**:`dsh-web-frontend/dist/manifest.webmanifest` 让页面成为
-  "可安装的 Web 应用",Chrome 于是在地址栏加安装入口。启动器打开的 profile 是临时的(关窗即删),装在那里
-  没有意义,因此 `seed_chrome_prefs` 在 Chrome 启动前把该 profile 的
-  `profile.default_content_setting_values.web_app_installation = 2`(阻止)写进 `Default\Preferences`
-  —— 与 Chrome 设置里的"Web 应用安装"同一项,已实测 Chrome 会保留该键。配置项
-  `block_web_app_install = false` 可关闭。**不要**去改 DSH 的前端文件来达到这个目的。
+- **地址栏的"安装"图标只能用应用窗口消除**:`dsh-web-frontend/dist/manifest.webmanifest` 让页面成为
+  "可安装的 Web 应用",Chrome 于是在**普通窗口的地址栏**加"安装"入口。**没有受支持的开关能去掉它**:
+  实测把 profile 的 `default_content_setting_values.web_app_installation` 置 2(阻止)后 Chrome 依然显示
+  该图标(它只是保留了设置),`--disable-features=WebAppInstallation` 也完全无效。因此启动器默认
+  `window_mode = app`(`--app=<url>`:无地址栏/无标签栏,图标无从出现);`normal` 保留地址栏但图标会回来。
+  **不要**去改 DSH 的前端文件,也不要再尝试用内容设置/特性开关消除它(已证伪,别重复踩坑)。
+  教训:`seed_chrome_prefs` 式的"预置偏好"必须用**用户可见的结果**验证,不能只看 Chrome 是否保留了键。
 - 注释与标识符用英文,面向用户的文案用中文。
 - 保持 `src/main.rs` 现有写法:单文件、`fn` 按主流程顺序排布、少抽象。
 

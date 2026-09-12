@@ -60,11 +60,15 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
    (项目路径含中文也能嵌图标)、修正文案笔误。
 8. **用户反馈:地址栏出现蓝色"安装"图标**。根因是 DSH 前端自带
    `dsh-web-frontend/dist/manifest.webmanifest`(`display: fullscreen`),Chrome 判定页面"可安装"。
-   启动器打开的 profile 是临时的、关窗即删,安装没有意义,因此新增 `seed_chrome_prefs`:在 Chrome
-   启动前写入该 profile 的 `Default\Preferences`
-   (`profile.default_content_setting_values.web_app_installation = 2`,即"Web 应用安装 = 阻止")。
-   已用 headless Chrome 实测该键被 Chrome 保留(156 → 9005 字节,与自身默认合并),说明它被认可;
-   配置项 `block_web_app_install = false` 可恢复图标。**没有**去改 DSH 的前端文件。
+   - 第一次尝试(1.3.0)**失败**:把该 profile 的
+     `default_content_setting_values.web_app_installation` 置 2(阻止)。事后核对:该设置**被 Chrome 保留
+     了**(Preferences 里确实存在)但地址栏图标依旧;随后用"只截窗口顶栏 + 逐行统计蓝像素"的方式实测,
+     `--disable-features=WebAppInstallation` 与基线**逐行完全一致**(毫无效果)。教训:预置偏好类改动
+     必须用**用户可见的结果**验证,不能只看键是否被保留。
+   - 最终方案(1.4.0):`window_mode`(默认 `app`)→ Chrome 应用窗口(`--app=<url>`),没有地址栏/标签栏,
+     图标无从出现(实测启动器传给 Chrome 的命令行确为 `--app=…`,关窗后服务正常停止)。
+     `window_mode = normal` 保留地址栏,但"安装"图标会回来——Chrome 没有受支持的开关能去掉它。
+   - 已移除失效的 `seed_chrome_prefs` / `block_web_app_install`;**没有**改 DSH 的前端文件。
 ## 下一步 TODO
 
 1. 关掉正在运行的实例后,**手动**把 `target\release\dsh-launcher.exe` 覆盖到仓库根目录的便捷副本

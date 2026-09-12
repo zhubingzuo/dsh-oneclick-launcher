@@ -71,7 +71,7 @@ port = 3080                                 # preferred port; 0 = always let dsh
 ui_marker = DeepSeek Harness                # text a reusable page must contain
 url_marker = dsh web:                       # text that marks the line carrying the URL
 timeout_secs = 300                          # readiness timeout
-block_web_app_install = true                # remove the address-bar Install chip
+window_mode = app                           # app = address-bar-less app window; normal = regular window
 ```
 
 The environment variable `DSH_LAUNCHER_CONFIG` can point at a different config file.
@@ -80,11 +80,13 @@ The environment variable `DSH_LAUNCHER_CONFIG` can point at a different config f
 > local web app, that page is not reused even when it answers 200 — the launcher starts its own
 > instance instead. Set it to an empty value to restore the loose "any 200 will do" behaviour.
 >
-> `block_web_app_install` removes the blue **Install** chip Chrome shows in the address bar. The DSH
-> page ships a `manifest.webmanifest` (an installable web app), so Chrome offers to install it. The
-> launcher's Chrome profile is temporary and deleted when the window closes, so installing into it is
-> pointless — the profile's "Web app installation" setting is therefore blocked before Chrome starts.
-> Set it to `false` to bring the chip back.
+> `window_mode` picks the window style. The DSH page ships a `manifest.webmanifest` (an installable
+> web app), so Chrome offers a blue **Install** chip in the address bar. **Chrome has no supported way
+> to hide that chip in a regular window** — measured: blocking the profile's "Web app installation"
+> content setting left the chip in place (Chrome kept the setting), and
+> `--disable-features=WebAppInstallation` changed nothing. The default `app` uses Chrome's app window
+> instead: **no address bar and no tab strip**, so the chip cannot appear and the window looks like a
+> standalone desktop app. Set `normal` to get the address bar back, together with Chrome's chip.
 
 ## Behavior in detail
 
@@ -180,7 +182,7 @@ Every failure points at the logs in its message box:
 | "could not obtain an access token" | A DSH release changed the output format: check `url_marker` in the config file |
 | Startup times out | Inspect `server.log`, or run the configured `command` in a terminal; raise `timeout_secs` if needed |
 | Two browser windows appear | Make sure you run the latest build (older builds lacked `--no-open`, so dsh opened a browser itself) |
-| A blue **Install** chip in the address bar | Chrome considers the DSH page installable because it ships a Web App Manifest. The launcher's own window already blocks it; in your everyday Chrome you can block it under Settings → Privacy and security → Site settings → Additional content settings → "Web app installation", or simply ignore it |
+| A blue **Install** chip in the address bar | Chrome considers the DSH page installable (it ships a Web App Manifest) and offers no supported way to hide that chip in a regular window. The launcher's default `window_mode = app` uses an address-bar-less app window, so the chip cannot appear; with `normal`, or in your everyday Chrome, you can block it under Settings → Privacy and security → Site settings → Additional content settings → "Web app installation", or simply ignore it |
 
 ## Repository layout
 

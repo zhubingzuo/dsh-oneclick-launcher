@@ -68,7 +68,7 @@ port = 3080                                 # 首选端口;0 = 总让 dsh 自己
 ui_marker = DeepSeek Harness                # 复用已有页面时必须包含的文字
 url_marker = dsh web:                       # 输出中标记网页地址的文字
 timeout_secs = 300                          # 就绪等待上限
-block_web_app_install = true                # 去掉地址栏的"安装"图标(见下)
+window_mode = app                           # app = 无地址栏的应用窗口;normal = 普通窗口
 ```
 
 也可以用环境变量 `DSH_LAUNCHER_CONFIG` 指定配置文件路径。
@@ -76,10 +76,12 @@ block_web_app_install = true                # 去掉地址栏的"安装"图标(�
 > `ui_marker` 是防误用的保险:首选端口上若有**别的**本地网页程序(而不是 DSH),它即使返回 200
 > 也不会被采用,启动器会另起自己的实例。把它设为空值则恢复"任何 200 都复用"的宽松行为。
 >
-> `block_web_app_install` 用于消除 Chrome 地址栏上的蓝色"**安装**"图标:DSH 网页自带
-> `manifest.webmanifest`(一个可安装的 Web 应用声明),Chrome 因此提供安装入口。启动器打开的
-> Chrome 配置是**临时**的(关窗即删),装在那里没有意义,所以默认在 Chrome 启动前把该配置档的
-> "Web 应用安装"设为**阻止**。想把这个图标要回来,改成 `false` 即可。
+> `window_mode` 决定窗口形态。DSH 网页自带 `manifest.webmanifest`(一份"可安装的 Web 应用"声明),
+> 所以 Chrome 会在**地址栏**里给出蓝色的"安装"入口。**Chrome 没有提供在普通窗口里隐藏它的受支持
+> 开关**——实测:把该配置档的"Web 应用安装"内容设置设为"阻止",Chrome 确实保留了该设置,但地址栏
+> 图标依旧;`--disable-features=WebAppInstallation` 也毫无变化。因此默认使用 `app`(Chrome 应用
+> 窗口):**没有地址栏、没有标签栏**,自然也不会有那个图标,整体更像一个独立的桌面应用。
+> 想要地址栏就改成 `normal`,但"安装"图标会回来(那是 Chrome 的行为,启动器消除不掉)。
 
 ## 行为细节
 
@@ -163,7 +165,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/gen_icon.ps1 -SvgPath "C:\
 | 弹窗提示"无法取得访问令牌" | DSH 更新后改了输出格式:检查配置文件里的 `url_marker` |
 | 启动超时 | 查看 `server.log`,或手动在终端运行配置里的 `command` 看详细错误;必要时调大 `timeout_secs` |
 | 看到多个浏览器窗口 | 确认运行的是最新版(旧版未加 `--no-open` 会让 dsh web 自己再开一个) |
-| 地址栏出现蓝色"**安装**"图标 | 那是 Chrome 认为 DSH 页面可安装(网页自带 Web App Manifest)。启动器默认已在自己打开的窗口里阻止它;若你用**日常 Chrome** 打开该地址,可在 Chrome 设置 → 隐私与安全 → 网站设置 → 更多内容设置 → "Web 应用安装" 里设为"不允许",或干脆忽略它 |
+| 地址栏出现蓝色"**安装**"图标 | 那是 Chrome 认为 DSH 页面可安装(网页自带 Web App Manifest),普通 Chrome 窗口里没有受支持的开关能去掉它。启动器默认用 `window_mode = app`(无地址栏的应用窗口),因此不会出现;若你改成 `normal`,或用**日常 Chrome** 打开该地址,就会看到它——可在 Chrome 设置 → 隐私与安全 → 网站设置 → 更多内容设置 → "Web 应用安装" 里设为"不允许",或直接忽略 |
 
 ## 目录结构
 
