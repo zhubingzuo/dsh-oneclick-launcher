@@ -36,10 +36,9 @@
 `ui_marker`**(默认 `DeepSeek Harness`)才复用;需令牌、非 HTTP、或不像 DSH 都改用 `--port 0` 另起自己的
 实例 → 按"完整命令 → 命令 + 空闲端口 → 仅命令"依次尝试(`cmd.exe` + `raw_arg` 原样传命令行,避免
 Rust 把引号转义成 `\"`;失败立即换下一档) → `wait_ready`(解析 dsh 打印的带 token URL;**端口先通
-不是失败**,裸地址只在真能 200/303 时才被接受,否则一直等到超时)→ 用独立临时 profile 按 `window_mode`
-开 Chrome(默认 `normal`:普通窗口,有地址栏;`app`:`--app=<url>` 应用窗口,无地址栏)→ 等窗口关闭 →
-只结束自己启动的服务(先 `try_wait` 确认它还活着再 `taskkill /T`,另有 Job Object `KILL_ON_JOB_CLOSE`
-兜底)→ 删临时 profile → 退出。
+不是失败**,裸地址只在真能 200/303 时才被接受,否则一直等到超时)→ 用独立临时 profile 开 Chrome →
+等窗口关闭 → 只结束自己启动的服务(先 `try_wait` 确认它还活着再 `taskkill /T`,另有 Job Object
+`KILL_ON_JOB_CLOSE` 兜底)→ 删临时 profile → 退出。
 
 运行期数据:`%LOCALAPPDATA%\dsh-launcher\` —— `launcher.log` 是本程序日志,`server.log` 是 dsh
 子进程的 stdout+stderr 合并。
@@ -92,14 +91,6 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
   专门盯这条。
 - **配置文件模板只写 ASCII**:用户会用记事本编辑 `dsh-launcher.conf`,若模板含中文注释而用户另存为
   ANSI,就得靠 `String::from_utf8_lossy` + 去 BOM 兜底(已实现)。新增模板文字请保持 ASCII。
-- **地址栏的"安装"图标无法在普通窗口里去掉了**:`dsh-web-frontend/dist/manifest.webmanifest` 让页面成为
-  "可安装的 Web 应用",Chrome 便在**普通窗口的地址栏**加"安装"入口。已证伪的尝试:内容设置
-  `default_content_setting_values.web_app_installation = 2`(Chrome 保留了该设置,图标依旧)、
-  `--disable-features=WebAppInstallation`(逐行像素与基线完全一致)、`WebAppInstallationPromo`、
-  `DesktopPWAInstallPromotionML`、`PwaInstall` 及其组合(均无变化)。因此 `window_mode` 是取舍:
-  **默认 `normal`**(有地址栏,也有该图标),`app`(`--app=<url>`:无地址栏/标签栏 → 图标无从出现)。
-  用户明确要地址栏,**不要再把默认改回 app**;也**不要**去改 DSH 的前端文件。
-  教训:凡"预置偏好 / 隐藏 UI"类改动,必须用**用户可见的结果**验证,不能只看键是否被保留。
 - 注释与标识符用英文,面向用户的文案用中文。
 - 保持 `src/main.rs` 现有写法:单文件、`fn` 按主流程顺序排布、少抽象。
 

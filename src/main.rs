@@ -309,14 +309,6 @@ url_marker = dsh web:
 
 # How long to wait for the server to become ready, in seconds.
 timeout_secs = 300
-
-# Window style.
-#   normal = an ordinary Chrome window: address bar and tab strip (default).
-#            Chrome shows its blue Install chip for the DSH page there, and no
-#            supported switch removes it.
-#   app    = a Chrome app window: no address bar, no tab strip, so the Install
-#            chip cannot appear — at the cost of the address bar.
-window_mode = normal
 ";
 
 struct LaunchConfig {
@@ -326,7 +318,6 @@ struct LaunchConfig {
     ui_marker: String,
     url_marker: String,
     timeout: Duration,
-    app_window: bool,
     /// True when DSH_SERVER_EXTRA replaced the command: the launcher then runs
     /// that command verbatim (regression scenarios rely on this).
     test_command: bool,
@@ -342,7 +333,6 @@ impl Default for LaunchConfig {
             ui_marker: "DeepSeek Harness".to_string(),
             url_marker: "dsh web:".to_string(),
             timeout: Duration::from_secs(300),
-            app_window: false,
             test_command: false,
             path: PathBuf::new(),
         }
@@ -421,11 +411,6 @@ impl LaunchConfig {
                             Ok(s) => cfg.timeout = Duration::from_secs(s),
                             Err(_) => log_msg(&format!("config: bad timeout_secs {value:?}")),
                         },
-                        "window_mode" => match value.to_ascii_lowercase().as_str() {
-                            "app" => cfg.app_window = true,
-                            "normal" | "window" => cfg.app_window = false,
-                            _ => log_msg(&format!("config: bad window_mode {value:?} (use app or normal)")),
-                        },
                         _ => log_msg(&format!("config: ignoring unknown key {key:?}")),
                     }
                 }
@@ -452,15 +437,13 @@ impl LaunchConfig {
         }
 
         log_msg(&format!(
-            "config {}: command={:?} extra_args=[{}] port={} ui_marker={:?} url_marker={:?} timeout={}s window_mode={}",
+            "config {}: command={:?} extra_args=[{}] port={} url_marker={:?} timeout={}s",
             path.display(),
             cfg.command,
             cfg.extra_args.join(" "),
             cfg.port,
-            cfg.ui_marker,
             cfg.url_marker,
-            cfg.timeout.as_secs(),
-            if cfg.app_window { "app" } else { "normal" }
+            cfg.timeout.as_secs()
         ));
         cfg
     }
@@ -921,7 +904,7 @@ fn fresh_profile_dir() -> PathBuf {
     dir
 }
 
-fn spawn_browser(url: &str, profile: &Path, app_window: bool) -> std::io::Result<Child> {
+fn spawn_browser(url: &str, profile: &Path) -> std::io::Result<Child> {
     // Fake chrome (tests): pings loopback for a while, then "closes".
     if let Ok(v) = env::var("DSH_FAKE_CHROME") {
         if let Ok(secs) = v.parse::<u64>() {
@@ -944,31 +927,23 @@ fn spawn_browser(url: &str, profile: &Path, app_window: bool) -> std::io::Result
         return Err(std::io::Error::other("Chrome not found"));
     };
     ensure_dir(profile);
-    log_msg(&format!(
-        "opening {url} with chrome ({}) : {}",
-        if app_window { "app window" } else { "normal window" },
-        chrome.display()
-    ));
+    log_msg(&format!("opening {url} with chrome: {}", chrome.display()));
     // A fresh dedicated profile dir means this is a brand-new, isolated Chrome
-    // instance: the window shows ONLY the DSH page — no bookmarks, extensions,
-    // logins, or other websites from the user's everyday Chrome.
-    //
-    // --app=<url> opens Chrome's app window: no address bar and no tab strip.
-    // That also removes the blue Install chip Chrome adds for the DSH page,
-    // which is gated by the page's web app manifest and has no supported switch
-    // of its own in a normal window. `normal` keeps a regular browser window.
-    let mut cmd = Command::new(&chrome);
-    cmd.arg(format!("--user-data-dir={}", profile.display()))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--disable-background-mode")
-        .arg("--disable-session-crashed-bubble");
-    if app_window {
-        cmd.arg(format!("--app={url}"));
-    } else {
-        cmd.arg("--new-window").arg(url);
-    }
-    cmd.stdin(Stdio::null())
+    // instance: its window opens with ONLY the DSH page — no bookmarks,
+    // extensions, logins, or other websites from the user's everyday Chrome.
+    // --new-window makes the single-page window explicit; the URL argument is
+    // the only content requested, so no extra tabs or "restore session" UI.
+    Command::new(&chrome)
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .args([
+            "--new-window",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-mode",
+            "--disable-session-crashed-bubble",
+        ])
+        .arg(url)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -1021,8 +996,8 @@ fn run() -> i32 {
     log_msg("=== DSH launcher start ===");
 
     let Some(_single) = SingleInstance::acquire() else {
-        // Another copy already manages a DSH window. Exiting silently would look
-        // like "double-clicking does nothing", which is exactly how users read it.
+        // Another copy already manages a DSH window. Exiting silently looks like
+        // "double-clicking does nothing" — say so instead.
         show_message(
             "DSH 启动器",
             "启动器已经在运行了。\n\n它打开的 DSH 窗口就是现在这个。要重新启动(例如换了新版程序),请先关闭那个窗口——这也会停止它启动的服务——然后再双击本程序。",
@@ -1190,7 +1165,7 @@ fn run() -> i32 {
     };
 
     let profile = fresh_profile_dir();
-    let mut browser = match spawn_browser(&url, &profile, cfg.app_window) {
+    let mut browser = match spawn_browser(&url, &profile) {
         Ok(b) => b,
         Err(e) => {
             log_msg(&format!("failed to open browser: {e}"));

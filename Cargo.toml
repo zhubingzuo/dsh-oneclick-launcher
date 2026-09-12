@@ -1,6 +1,6 @@
 [package]
 name = "dsh-launcher"
-version = "1.4.2"
+version = "1.5.0"
 edition = "2021"
 # Windows 10 / 11 (64-bit). MSRV comes from `Option::is_none_or` (Rust 1.82).
 rust-version = "1.82"

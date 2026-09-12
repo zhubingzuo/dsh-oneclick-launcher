@@ -71,7 +71,6 @@ port = 3080                                 # preferred port; 0 = always let dsh
 ui_marker = DeepSeek Harness                # text a reusable page must contain
 url_marker = dsh web:                       # text that marks the line carrying the URL
 timeout_secs = 300                          # readiness timeout
-window_mode = normal                        # normal = regular window with address bar (default); app = no address bar
 ```
 
 The environment variable `DSH_LAUNCHER_CONFIG` can point at a different config file.
@@ -79,16 +78,6 @@ The environment variable `DSH_LAUNCHER_CONFIG` can point at a different config f
 > `ui_marker` guards against adopting the wrong thing: if the preferred port is held by some *other*
 > local web app, that page is not reused even when it answers 200 — the launcher starts its own
 > instance instead. Set it to an empty value to restore the loose "any 200 will do" behaviour.
->
-> `window_mode` is the trade-off between the address bar and Chrome's blue **Install** chip:
-> - **`normal` (default)**: an ordinary Chrome window with address bar and tab strip. Because the DSH
->   page ships `manifest.webmanifest` (an installable web app), Chrome shows an Install entry in the
->   address bar. **That chip cannot be removed in a regular window**: measured — blocking the profile's
->   "Web app installation" content setting, as well as `--disable-features=WebAppInstallation`,
->   `WebAppInstallationPromo`, `DesktopPWAInstallPromotionML` and `PwaInstall`, all left the chip in
->   place (Chrome provides no such switch).
-> - **`app`**: a Chrome app window — **no address bar and no tab strip**, so the chip cannot appear,
->   at the cost of the address bar.
 
 ## Behavior in detail
 
@@ -184,7 +173,6 @@ Every failure points at the logs in its message box:
 | "could not obtain an access token" | A DSH release changed the output format: check `url_marker` in the config file |
 | Startup times out | Inspect `server.log`, or run the configured `command` in a terminal; raise `timeout_secs` if needed |
 | Two browser windows appear | Make sure you run the latest build (older builds lacked `--no-open`, so dsh opened a browser itself) |
-| A blue **Install** chip in the address bar | Chrome considers the DSH page installable (it ships a Web App Manifest) and **offers no way to hide that chip in a regular window** — measured: the "Web app installation" content setting and the `--disable-features=WebAppInstallation` / `WebAppInstallationPromo` / `DesktopPWAInstallPromotionML` / `PwaInstall` flags all left it in place. To never see it, set `window_mode = app` (app window, **no address bar**); otherwise ignore it — it is only an install entry point |
 
 ## Repository layout
 
@@ -192,9 +180,8 @@ Every failure points at the logs in its message box:
 dsh-launcher/
 ├─ assets/icon.ico              # application icon (multi-size)
 ├─ scripts/gen_icon.ps1         # icon generator
-├─ scripts/regression.ps1       # end-to-end regression scenarios A-E (32 checks)
-├─ scripts/test-stub-server.ps1 # stub services used by scenarios C/D
-├─ scripts/test-slow-server.ps1 # late-tokenized-URL service used by scenario E
+├─ scripts/regression.ps1       # end-to-end regression scenarios A/B/C
+├─ scripts/test-stub-server.ps1 # token-less stub service used by scenario C
 ├─ build.rs                     # zero-dependency icon embedding (rc.exe)
 ├─ src/main.rs                  # the whole program (std + a little hand-written Win32 FFI)
 ├─ AGENTS.md / HANDOFF.md       # project conventions / handoff notes (Chinese)

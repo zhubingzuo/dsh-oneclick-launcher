@@ -1,6 +1,12 @@
 # HANDOFF
 
 > 接手前先读本文件。改动代码后请更新它;更早的进展见 `docs/LOG.md`。
+## 当前状态(2026-09-12)
+
+代码已**回退到 1.2.0**(`3b8ba48`)的内容,即"地址栏安装图标"相关改动**全部移除**:
+没有 `window_mode`、没有 `--app` 应用窗口、没有预置偏好逻辑;窗口始终是**带地址栏的普通 Chrome 窗口**,
+地址栏里 Chrome 的"安装"图标按用户要求**保留**(不再尝试移除)。唯一保留的例外:1.4.1 中与图标无关的
+"启动器已在运行时弹中文提示"。因为 `v1.2.0` 标签已被占用,这一版**版本号记为 1.5.0**(代码内容 = 1.2.0)。
 ## 任务目标
 
 让 Windows(10/11 x64)上双击 `dsh-launcher.exe` 一键打开 DSH(DeepSeek Harness)网页界面:
@@ -52,26 +58,12 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
 5. **Important**:配置非 UTF-8(记事本 ANSI)时静默失效。现改为按字节读 + 去 UTF-8 BOM +
    `from_utf8_lossy`,ASCII 键值仍可用。
 6. **Important**:仓库根目录的便捷 exe 是 1.0 旧版(308,224 字节,且被运行中实例锁定无法覆盖)。
-   新版为 `target\release\dsh-launcher.exe`(1.3.0);已额外复制一份到**仓库外**
-   `K:\BaiduSyncdisk\Rust\dsh\dsh-launcher-1.3.0.exe` 供直接双击,根目录旧副本待实例关闭后覆盖。
+   新版为 `target\release\dsh-launcher.exe`(1.2.0);已额外复制一份到**仓库外**
+   `K:\BaiduSyncdisk\Rust\dsh\dsh-launcher-1.2.0.exe` 供直接双击,根目录旧副本待实例关闭后覆盖。
 7. **Minor**:回退链第 2 档原会丢掉 `--port`(dsh 默认 3080,正是用户最可能占用的端口)。现改为
    "完整命令 → 命令 + `--port 0` → 仅命令";日志读改 seek(不再整文件读);启动失败弹窗补充
    "日志目录不可写"这一可能;`build.rs` 的 rc.exe 探测重写(SDK 目录/PATH)、加 `/c 65001`
    (项目路径含中文也能嵌图标)、修正文案笔误。
-8. **用户反馈:地址栏出现蓝色"安装"图标**。根因是 DSH 前端自带
-   `dsh-web-frontend/dist/manifest.webmanifest`(`display: fullscreen`),Chrome 判定页面"可安装"。
-   - 第一次尝试(1.3.0)**失败**:把该 profile 的
-     `default_content_setting_values.web_app_installation` 置 2(阻止)。事后核对:该设置**被 Chrome 保留
-     了**(Preferences 里确实存在)但地址栏图标依旧;随后用"只截窗口顶栏 + 逐行统计蓝像素"的方式实测,
-     `--disable-features=WebAppInstallation` 与基线**逐行完全一致**(毫无效果)。教训:预置偏好类改动
-     必须用**用户可见的结果**验证,不能只看键是否被保留。
-   - 最终方案:`window_mode` 可配置。**1.4.2 起默认 `normal`**(普通窗口:有地址栏/标签栏,Chrome 的
-     "安装"芯片随之存在),因为用户明确**需要地址栏**;`app`(`--app=<url>`:无地址栏/标签栏,图标无从出现)
-     保留为可选。补充证伪:`WebAppInstallationPromo`、`DesktopPWAInstallPromotionML`、`PwaInstall`
-     及其组合经实测均无法移除该芯片 ⇒ **保留地址栏就必然有那个图标**。
-   - 已移除失效的 `seed_chrome_prefs` / `block_web_app_install`;**没有**改 DSH 的前端文件。
-   - 踩过的坑:配置文件读取的是 **exe 同目录**那一份(`dsh-launcher.conf`);曾误改项目目录内的同名文件,
-     用户没生效。改配置前先确认 exe 的实际位置。
 ## 下一步 TODO
 
 1. 关掉正在运行的实例后,**手动**把 `target\release\dsh-launcher.exe` 覆盖到仓库根目录的便捷副本
@@ -101,9 +93,15 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
 `AGENTS.md`(架构与约定)、`scripts/regression.ps1` + 两个 stub 脚本、`docs/LOG.md`(会话存档)。
 ## 最新 commit
 
-本次修复提交见 `git log`(父提交为 `b174af0` 中英双语文档)。更早:
+回退提交见 `git log`(把图标相关的 8aa1284 / eee187c / 57142ca 的改动整体撤销,保留 0c26632 的提示)。
+更早:
 
 ```
+57142ca  change: 窗口模式默认改回 normal(已撤销)
+0c26632  fix: 已在运行时的第二个实例给出中文提示(保留)
+eee187c  feat: 默认改用 Chrome 应用窗口(已撤销)
+8aa1284  feat: 去掉地址栏的安装图标(已撤销)
+3b8ba48  fix: 修复代码评审发现的问题(含 Win10/11 兼容性核查)  ← 现在的内容以它为准
 b174af0  docs: 中英双语介绍(README.en.md + 双向语言链接 + 徽章)
 0686272  docs: 交接状态更新(已推送、已发布 v1.1.0)
 643154f  docs: 会话存档(抗版本变化改造与 A/B/C 回归结果)
