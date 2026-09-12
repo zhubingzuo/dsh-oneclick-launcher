@@ -4,56 +4,79 @@
 ## 任务目标
 
 让 Windows 上双击 `dsh-launcher.exe` 一键打开 DSH(DeepSeek Harness)网页界面:静默启动
-`npx @deepseek-ai/dsh web`、开干净独立 Chrome 窗口、关窗即停、无残留、不干扰别人的服务。
-功能已完成并验证,处于维护状态。
+dsh web、开干净独立 Chrome 窗口、关窗即停、无残留、不干扰别人的服务;并且 **DSH 升级后通常
+不需要重新编译本启动器**(地址取自 dsh 自身输出,启动方式写在外部配置文件里)。功能已完成并验证。
 ## 测试命令
 
-无自动化测试(无 `tests/`、无 `#[test]`)。回归 = 两套 `DSH_*` 端到端场景,共 16 项判据:
+无单元测试,回归 = `scripts/regression.ps1`(A/B/C 三套、20 项判据,约 2 分钟):
 
 ```powershell
 cargo build --release
-# A:首选端口空闲(不要设 DSH_SERVER_EXTRA,以验证 DSH_PORT 真透传)
-$env:DSH_DATA_DIR="K:\tmp\dshA"; $env:DSH_PORT="3099"; $env:DSH_FAKE_CHROME="12"; $env:DSH_NO_UI="1"; .\target\release\dsh-launcher.exe
-# B:先手起服务占住 3099(它就是"别人的服务"),再启动 launcher:应改用其它端口且不碰它
-npx --yes @deepseek-ai/dsh web --no-open --port 3099
-$env:DSH_DATA_DIR="K:\tmp\dshB"; .\target\release\dsh-launcher.exe
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
 ```
 
-判据 A(8 项):`server ready` 落在 3099 且带 `?token=`、命令行含 `--port 3099`、该 URL 直连 `303`→follow
-`200`、响应体 >20000、裸地址 `401`、关窗后打印 `DSH launcher exit` 且端口释放。判据 B(8 项):识别占用、
-命令行含 `--port 0`、新端口 ≠3099、新地址 `303`/`200`、原服务在运行期间与 launcher 退出后都仍在监听且 URL 仍 `200`。
+- **A** 首选端口(3099)空闲 → 启动器应自己起服务(`--port 3099`)、读到带 token 的 URL、
+  关窗后打印 `stopping server tree` 且端口释放。
+- **B** 3099 已被**带 token**的 dsh 占用 → 应识别 `HTTP 401`、改用 `--port 0` 另起实例,
+  原服务在 launcher 运行期间与退出后都仍在(仍 401)。
+- **C** 3099 已被**无 token**的 stub 服务占用 → 应直接复用(日志出现
+  `already serves the UI without a token; reusing it`)、**不出现** `server command:`、
+  退出时**不出现** `stopping server tree`,且 stub 仍存活。
+
+脚本会设置 `DSH_SKIP_SINGLE_INSTANCE=1`,因此**本机正在使用的启动器实例无需关闭**;它只用
+`.testdata\` 下的独立数据目录与 3099 端口。跑之前先确认 3099 空闲(脚本会检查)。
 ## 本次完成及验证结果
 
-- 代码与文档已在 `c4601f4` 提交完毕(`src/main.rs` 三处修复 + README + AGENTS/CLAUDE/HANDOFF)。
-- 验证(2026-09-11):A 场景 **8/8 PASS**、B 场景 **8/8 PASS**,用的是与 `c4601f4` 一致的源码与 exe。
-- 本次存档会话重跑**被单实例锁阻塞,未能执行**(非代码失败):17:02 双击启动的实例(pid 26660)持有
-  `Local\dsh-launcher-single`,两次启动都只写一行 `another launcher instance is running; exiting`。按"不临时修"
-  原则如实记录,未结束任何进程、未改任何代码;该实例日志本身即新版正面证据(`--port 3080` + `server ready: …?token=…`)。
-- 工作区干净、无新提交,故上次 16/16 的结果对本提交仍然有效。
+- 代码与文档提交在 `f03321e`(8 文件,+746/-182):核心是"抗版本变化"改造,详见下条。
+- 验证(2026-09-12):先用临时脚本、再用仓库内的 `scripts/regression.ps1` 各跑一次,
+  **两次均 20/20 PASS**(A 7 项、B 7 项、C 6 项)。
+- 期间**没有**结束任何用户正在使用的进程:本次会话所依赖的 dsh web 与它的 launcher
+  (pid 28400,启动的 3080 服务)全程保持运行,仅测试自己的实例被启动/结束。
+## 本次改动要点(抗 DSH 版本变化)
+
+1. **外部配置 `dsh-launcher.conf`**:exe 同目录首次运行自动生成(不可写时退回数据目录),
+   含 `command` / `extra_args` / `port` / `url_marker` / `timeout_secs`;`DSH_LAUNCHER_CONFIG`
+   可指定路径。DSH 改动启动方式时改文本即可,无需重编译。
+2. **复用而非抢占**:首选端口上的服务若对裸地址返回 200/303(老版本、无需令牌)则**直接复用**,
+   关窗时不动它;若 401(需令牌)或非 HTTP,则用 `--port 0` 另起自己的实例。
+3. **启动回退链**:`完整命令 → 去掉 --port → 仅命令`,任何一次在就绪前退出就换下一档,
+   因此参数被改名/移除时仍能启动。
+4. **URL 解析双形态**:先按 `url_marker` 取标记后第一个 http(s) 地址;失败再全局匹配
+   "带 token 的本地地址"。裸地址**仅在真能 200/303 时**才被交给浏览器,否则弹窗提示改
+   `url_marker`,不再出现"静默打开 401 页面"。
+5. **测试基建**:新增 `scripts/regression.ps1` + `scripts/test-stub-server.ps1`,以及
+   `DSH_SKIP_SINGLE_INSTANCE` 开关(解决"实例在跑就没法回归"的老问题)。
 ## 下一步 TODO
 
-1. 关掉正在运行的实例后重跑 A/B 两套场景,确认 16/16。
-2. 排查旧日志里 09-10 出现的"打开浏览器后 1 秒即关闭"异常(与本轮问题无关)。
-3. 若某版 dsh 不再打印带 token 的 URL,固定端口路径会在 5 秒宽限后回落裸地址(必 401);届时改为直接报错。
-4. `DSH_FAKE_CHROME=N` 实际是 `ping -n 2N`(约 2N 秒),与 README "N 秒后关闭" 措辞不符,可择机校正。
-5. 远端未推送:本地 `main` 领先 `origin/main`,`c4601f4` 尚未 `git push`。
+1. 关掉正在运行的实例后,**手动**把 `target\release\dsh-launcher.exe` 覆盖到仓库根目录的
+   便捷副本 `dsh-launcher.exe`(该副本当前被运行中的实例锁定,仍是 1.0 时代的旧版)。
+2. `f03321e` 需要 `git push` 到 `origin/main`(此前 `c4601f4`、`8eb0b9d` 也尚未推送)。
+   推送后可在 GitHub 建 Release 并把 exe 作为附件,方便直接下载。
+3. 若某版 dsh 既不打印带 token 的 URL、裸地址又不可用,现在会明确报错并指向 `url_marker`
+   (旧行为是"5 秒宽限后回落裸地址"),这是有意为之,不要改回静默回落。
+4. 可选的下一步演进:把"复用无令牌服务"的判断从 `GET /` 扩展到更明确的能力探测;
+   以及给 `.conf` 增加"额外尝试命令列表"(目前回退链是内置三档)。
 ## 当前的坑
 
-- **裸地址必失败**:`dsh web` 的 UI 要进程级 launch token(只在其内存、不落盘、无开关可关),裸地址恒
-  `401`(浏览器上可能显示成 404)。启动器从 `server.log` 解析它打印的那行 URL;日志追加写,必须只扫
-  `log_from` 之后的新增字节,别整文件搜索,否则会复用上一次的旧 token。
-- **单实例锁会静默退出**:有实例在跑时新实例不报错、不起服务、直接退出——跑测试前先确认没有 launcher 在运行。
-- `DSH_FAKE_CHROME` 分支**不会**打 `opening … with chrome`,取地址要读 `server ready:` 行。
-- 端口探测超时仅 400ms;`netstat` 里的 `TIME_WAIT` 不是 LISTENING,不参与判定。
+- **单实例锁会静默退出**:有实例在跑时新实例只写一行日志就退出;跑回归务必带
+  `DSH_SKIP_SINGLE_INSTANCE=1`。
+- **裸地址必失败**:`dsh web` 的 UI 要进程级 launch token(只在其内存、不落盘、无开关可关),
+  裸地址恒 `401`。启动器只把 dsh 打印的带 token URL 交给浏览器。
+- **日志追加写**:解析 dsh 输出必须只用 `log_from` 之后的新增字节,否则会复用上一次的旧 token。
+- **端口探测超时仅 400ms**;`netstat` 里的 `TIME_WAIT` 不是 LISTENING,不参与判定。
+- **仓库根目录的便捷 exe 会被运行中的实例锁定**,无法覆盖;必须先关窗口。
+- `DSH_FAKE_CHROME=N` 实际是 `ping -n 2N`(约 2N 秒)。README 已按"约 N 秒"描述。
 ## 下次恢复需打开的关键文件
 
-`src/main.rs`(全部逻辑:`start_server`/`find_launch_url`/`url_port`/`wait_ready`/`run`)、`README.md`(行为与
-`DSH_*` 开关表)、`AGENTS.md`(架构与约定)、`docs/LOG.md`(会话存档)。
+`src/main.rs`(全部逻辑:`LaunchConfig::load`/`config_path`/`find_launch_url`/`http_status`/
+`build_attempts`/`start_server`/`wait_ready`/`run`)、`README.md`(行为表与 `DSH_*` 开关)、
+`AGENTS.md`(架构与约定)、`scripts/regression.ps1`(回归)、`docs/LOG.md`(会话存档)。
 ## 最新 commit
 
 ```
+f03321e  feat: 抗 DSH 版本变化的启动方式(外部配置 + 复用已有服务 + 参数回退)   ← 本次代码提交
+8eb0b9d  docs: 会话存档
 c4601f4  修复:用 dsh 打印的 token URL 打开浏览器,并修正 DSH_PORT 与端口占用处理
-316498c  Initial release: DSH one-click launcher for Windows  ← origin/main 仍停在这里,未 push
+316498c  Initial release: DSH one-click launcher for Windows
 ```
-
-第 3 步无代码变更,故此处填上一次的代码提交;紧随其后的是一笔 `docs: 会话存档`。
+`origin/main` 目前仍停在 `316498c`,以上三个提交都还没推送。
