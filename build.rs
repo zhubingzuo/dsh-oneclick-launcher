@@ -1,28 +1,41 @@
 //! Zero-dependency resource embedding for the Windows exe icon.
 //!
-//! Locates rc.exe from the Windows SDK (installed on this machine) and
-//! compiles a tiny .rc that references assets/icon.ico into a .res file,
-//! which is then passed to the MSVC linker. If rc.exe cannot be found the
-//! build still succeeds — the program simply ends up without an embedded
-//! icon.
+//! Locates rc.exe from the Windows SDK and compiles a tiny .rc that references
+//! assets/icon.ico into a .res file, which is then passed to the MSVC linker.
+//! If rc.exe cannot be found the build still succeeds — the program simply ends
+//! up without an embedded icon.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Candidate `rc.exe` locations, in order: SDK environment variables, the two
+/// standard Windows Kits roots (both `bin\<version>\<arch>` and `bin\<arch>`),
+/// then PATH. Newest SDK version wins.
 fn find_rc() -> Option<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
-    for var in ["WindowsSdkDir", "WindowsSdkBinPath"] {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Both of these point straight at the directory holding rc.exe.
+    for var in ["RcExePath", "WindowsSdkBinPath"] {
         if let Ok(v) = std::env::var(var) {
             if !v.is_empty() {
-                roots.push(PathBuf::from(v));
+                candidates.push(PathBuf::from(v).join("rc.exe"));
             }
         }
     }
-    roots.push(PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin"));
-    roots.push(PathBuf::from(r"C:\Program Files\Windows Kits\10\bin"));
 
-    for root in &roots {
-        // Windows 10 SDK layout: bin\<version>\x64\rc.exe
+    let mut sdk_bin_roots: Vec<PathBuf> = Vec::new();
+    if let Ok(v) = std::env::var("WindowsSdkDir") {
+        if !v.is_empty() {
+            // WindowsSdkDir is the Kits root (…\Windows Kits\10), so rc lives
+            // under its bin\<version>\<arch>.
+            sdk_bin_roots.push(PathBuf::from(v).join("bin"));
+        }
+    }
+    sdk_bin_roots.push(PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin"));
+    sdk_bin_roots.push(PathBuf::from(r"C:\Program Files\Windows Kits\10\bin"));
+
+    for root in &sdk_bin_roots {
+        // bin\<version>\<arch>\rc.exe — newest version first.
         if let Ok(entries) = std::fs::read_dir(root) {
             let mut versions: Vec<PathBuf> = entries
                 .filter_map(|e| e.ok())
@@ -30,34 +43,26 @@ fn find_rc() -> Option<PathBuf> {
                 .filter(|p| p.is_dir())
                 .collect();
             versions.sort();
-            // try newest version dir first
             for dir in versions.iter().rev() {
                 for arch in ["x64", "x86"] {
-                    let cand = dir.join(arch).join("rc.exe");
-                    if cand.is_file() {
-                        return Some(cand);
-                    }
-                }
-            }
-            // maybe SDK layout is bin\x64\rc.exe directly
-            for arch in ["x64", "x86"] {
-                let cand = root.join(arch).join("rc.exe");
-                if cand.is_file() {
-                    return Some(cand);
+                    candidates.push(dir.join(arch).join("rc.exe"));
+                    candidates.push(dir.join("rc.exe"));
                 }
             }
         }
-        // plain rc.exe on PATH
-        if let Ok(p) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&p) {
-                let cand = dir.join("rc.exe");
-                if cand.is_file() {
-                    return Some(cand);
-                }
-            }
+        // bin\<arch>\rc.exe
+        for arch in ["x64", "x86"] {
+            candidates.push(root.join(arch).join("rc.exe"));
         }
     }
-    None
+
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            candidates.push(dir.join("rc.exe"));
+        }
+    }
+
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 fn main() {
@@ -73,7 +78,7 @@ fn main() {
 
     let rc_path = Path::new(&out_dir).join("app.rc");
     if std::fs::write(&rc_path, rc_content).is_err() {
-        println!("cargo:warning=dsb-launcher: could not write {rc_path:?}");
+        println!("cargo:warning=dsh-launcher: could not write {rc_path:?}");
         return;
     }
 
@@ -83,7 +88,13 @@ fn main() {
     };
 
     let res_path = Path::new(&out_dir).join("app.res");
+    // /c 65001 makes rc read the .rc as UTF-8, so a project path containing
+    // non-ASCII characters still resolves (the default code page would mangle it
+    // and silently drop the icon).
     let status = Command::new(&rc_exe)
+        .arg("/nologo")
+        .arg("/c")
+        .arg("65001")
         .arg("/fo")
         .arg(&res_path)
         .arg(&rc_path)

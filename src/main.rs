@@ -21,14 +21,14 @@
 //!
 //! Test-only knobs (see README): DSH_DATA_DIR, DSH_PORT, DSH_SERVER_EXTRA,
 //! DSH_FAKE_CHROME, DSH_NO_UI, DSH_READY_TIMEOUT_SECS, DSH_CHROME,
-//! DSH_LAUNCHER_CONFIG.
+//! DSH_LAUNCHER_CONFIG, DSH_SKIP_SINGLE_INSTANCE.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
 use std::ffi::c_void;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
@@ -40,6 +40,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DEFAULT_PORT: u16 = 3080;
 const CONFIG_FILE_NAME: &str = "dsh-launcher.conf";
+const PID_FILE_NAME: &str = "launcher.pid";
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+const ERROR_INVALID_PARAMETER: u32 = 87;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9; // JobObjectExtendedLimitInformation
 const ERROR_ALREADY_EXISTS: u32 = 183;
@@ -66,6 +69,11 @@ extern "system" {
         cb_job_object_information_length: u32,
     ) -> i32;
     fn CloseHandle(h_object: *mut c_void) -> i32;
+    fn OpenProcess(
+        dw_desired_access: u32,
+        b_inherit_handle: i32,
+        dw_process_id: u32,
+    ) -> *mut c_void;
     fn CreateMutexW(
         lp_mutex_attributes: *const c_void,
         b_initial_owner: i32,
@@ -196,6 +204,75 @@ fn read_tail(path: &Path, max_bytes: usize) -> String {
     }
 }
 
+/// Logs are append-only across runs; drop an oversized one instead of letting it
+/// grow forever (readiness scanning and error dialogs only ever look at the tail,
+/// and `start_server` records its offset after this runs).
+fn rotate_log(path: &Path, max_bytes: u64) {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > max_bytes && fs::remove_file(path).is_ok() {
+            log_msg(&format!(
+                "rotated oversized log {} ({} bytes)",
+                path.display(),
+                meta.len()
+            ));
+        }
+    }
+}
+
+/// Removes `profiles\run-*` directories left behind by earlier runs (Chrome may
+/// still hold locks when the launcher exits, so cleanup is best-effort there).
+/// A directory whose recorded launcher pid is still alive is never touched, so a
+/// profile belonging to a launcher that is still open cannot be deleted — even
+/// one whose Chrome window has been open for days.
+fn prune_profiles(fallback_age: Duration) {
+    let dir = data_dir().join("profiles");
+    let Ok(entries) = fs::read_dir(&dir) else { return };
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("run-") {
+            continue;
+        }
+        let path = entry.path();
+        // Owned by a live launcher (possibly another Windows session)? Keep it.
+        if let Ok(text) = fs::read_to_string(path.join(PID_FILE_NAME)) {
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                if pid_alive(pid) {
+                    continue;
+                }
+            }
+        }
+        // No pid file (an older version's directory) or the owner is gone:
+        // remove it once it is old enough.
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .map(|age| age > fallback_age)
+            .unwrap_or(false);
+        if stale && fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        log_msg(&format!("pruned {removed} stale Chrome profile dir(s)"));
+    }
+}
+
+/// Whether a process with that pid currently exists. An access-denied answer
+/// still proves existence (the pid belongs to someone).
+fn pid_alive(pid: u32) -> bool {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() != ERROR_INVALID_PARAMETER;
+        }
+        CloseHandle(handle);
+        true
+    }
+}
+
 // ---------------------------------------------------------------------------
 // configuration
 //
@@ -216,10 +293,15 @@ command = npx --yes @deepseek-ai/dsh web
 # --no-open keeps dsh from opening a browser of its own.
 extra_args = --no-open
 
-# Preferred port. If something without a token already serves it, that service
-# is reused; if it is busy, the launcher starts its own instance on a free port.
-# Use 0 to always let dsh pick a free port.
+# Preferred port. If a token-less DSH UI already serves it, that service is
+# reused; if it is busy with anything else, the launcher starts its own instance
+# on a free port. Use 0 to always let dsh pick a free port.
 port = 3080
+
+# A page already served on the preferred port is only reused when its body
+# contains this text, so the launcher never adopts an unrelated local web app.
+# Set it to an empty value to reuse any page that answers HTTP 200.
+ui_marker = DeepSeek Harness
 
 # Text that marks the line of dsh output carrying the launch URL; the first
 # http(s) URL after it is handed to the browser.
@@ -233,6 +315,7 @@ struct LaunchConfig {
     command: String,
     extra_args: Vec<String>,
     port: u16,
+    ui_marker: String,
     url_marker: String,
     timeout: Duration,
     /// True when DSH_SERVER_EXTRA replaced the command: the launcher then runs
@@ -247,6 +330,7 @@ impl Default for LaunchConfig {
             command: "npx --yes @deepseek-ai/dsh web".to_string(),
             extra_args: vec!["--no-open".to_string()],
             port: DEFAULT_PORT,
+            ui_marker: "DeepSeek Harness".to_string(),
             url_marker: "dsh web:".to_string(),
             timeout: Duration::from_secs(300),
             test_command: false,
@@ -296,8 +380,13 @@ impl LaunchConfig {
         let path = config_path();
         let mut cfg = LaunchConfig { path: path.clone(), ..LaunchConfig::default() };
 
-        match fs::read_to_string(&path) {
-            Ok(text) => {
+        match fs::read(&path) {
+            Ok(bytes) => {
+                // Tolerate a UTF-8 BOM and non-UTF-8 files (e.g. Notepad saving
+                // as ANSI): decode lossily so ASCII keys and values still work
+                // instead of silently falling back to every default.
+                let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+                let text = String::from_utf8_lossy(bytes);
                 for line in text.lines() {
                     let line = line.trim();
                     if line.is_empty() || line.starts_with('#') {
@@ -316,6 +405,8 @@ impl LaunchConfig {
                             Err(_) => log_msg(&format!("config: bad port {value:?}; keeping {}", cfg.port)),
                         },
                         "url_marker" => cfg.url_marker = value.to_string(),
+                        // An empty value is meaningful here: reuse any HTTP 200 page.
+                        "ui_marker" => cfg.ui_marker = value.to_string(),
                         "timeout_secs" => match value.parse::<u64>() {
                             Ok(s) => cfg.timeout = Duration::from_secs(s),
                             Err(_) => log_msg(&format!("config: bad timeout_secs {value:?}")),
@@ -373,18 +464,31 @@ impl LaunchConfig {
 /// does not break the launcher: the configured `marker` line first, then any
 /// loopback URL that carries a token query anywhere in this run's output.
 fn find_launch_url(from_offset: u64, marker: &str) -> Option<String> {
-    let bytes = fs::read(server_log_path()).ok()?;
-    let start = (from_offset as usize).min(bytes.len());
-    let text = String::from_utf8_lossy(&bytes[start..]);
+    let mut file = fs::File::open(server_log_path()).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = from_offset.min(len);
+    if start == len {
+        return None; // nothing appended since the spawn
+    }
+    // Seek instead of reading the whole (append-only, ever growing) log.
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
 
     let strip = |tok: &str| tok.trim_end_matches([')', ',', '.']).to_string();
+    // Only the local UI address may ever reach the browser: never a LAN address
+    // from the "(LAN: …)" suffix or anything else dsh might print.
+    let is_loopback = |url: &str| {
+        url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:")
+    };
 
     if !marker.is_empty() {
         for line in text.lines() {
             let Some(at) = line.find(marker) else { continue };
             for token in line[at + marker.len()..].split_whitespace() {
                 let url = strip(token);
-                if url.starts_with("http://") || url.starts_with("https://") {
+                if is_loopback(&url) {
                     return Some(url);
                 }
             }
@@ -394,8 +498,7 @@ fn find_launch_url(from_offset: u64, marker: &str) -> Option<String> {
     for line in text.lines() {
         for token in line.split_whitespace() {
             let url = strip(token);
-            let loopback = url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:");
-            if loopback && (url.contains("?token=") || url.contains("&token=")) {
+            if is_loopback(&url) && (url.contains("?token=") || url.contains("&token=")) {
                 return Some(url);
             }
         }
@@ -413,8 +516,9 @@ fn url_port(url: &str) -> Option<u16> {
     rest.split(['/', '?']).next()?.parse().ok()
 }
 
-/// Status code of `GET /` on the port, or `None` when nothing answers HTTP.
-fn http_status(port: u16) -> Option<u16> {
+/// `GET /` on the port: HTTP status code plus the first `max_body` bytes of the
+/// response body. `None` when nothing answers HTTP there.
+fn http_get(port: u16, max_body: usize) -> Option<(u16, String)> {
     let mut stream = TcpStream::connect_timeout(&addr_for(port), Duration::from_millis(600)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
@@ -422,10 +526,24 @@ fn http_status(port: u16) -> Option<u16> {
         "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: dsh-launcher\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).ok()?;
-    let mut buf = [0u8; 256];
-    let n = stream.read(&mut buf).ok()?;
-    let head = String::from_utf8_lossy(&buf[..n]);
-    head.lines().next()?.split_whitespace().nth(1)?.parse().ok()
+
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 2048];
+    while buf.len() <= max_body + 512 {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break, // timeout or reset: whatever arrived is enough
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let status: u16 = text.lines().next()?.split_whitespace().nth(1)?.parse().ok()?;
+    let body = match text.find("\r\n\r\n") {
+        Some(at) => text[at + 4..].to_string(),
+        None => String::new(),
+    };
+    Some((status, body))
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +713,10 @@ fn build_attempts(cfg: &LaunchConfig, bind_port: Option<u16>) -> Vec<LaunchAttem
         Some(p) => format!(" --port {p}"),
         None => " --port 0".to_string(),
     };
+    // The port is kept in every attempt that still passes flags: dsh's own
+    // default is 3080, which is exactly the port a user is likely to have in
+    // use, so dropping --port (the 2nd attempt) would collide instead of
+    // starting our own instance. Only the last resort drops all flags.
     vec![
         LaunchAttempt {
             label: "command + extra args + port",
@@ -602,12 +724,12 @@ fn build_attempts(cfg: &LaunchConfig, bind_port: Option<u16>) -> Vec<LaunchAttem
             probe_port: bind_port,
         },
         LaunchAttempt {
-            label: "command + extra args (no --port)",
-            cmdline: format!("{}{}", cfg.command, extra),
+            label: "command + a free port (no extra args)",
+            cmdline: format!("{} --port 0", cfg.command),
             probe_port: None,
         },
         LaunchAttempt {
-            label: "command only",
+            label: "command only (no flags at all)",
             cmdline: cfg.command.clone(),
             probe_port: None,
         },
@@ -620,11 +742,24 @@ fn start_server(job: Option<&KillJob>, cmdline: &str) -> std::io::Result<(Child,
     let server_log = server_log_path();
     ensure_dir(server_log.parent().unwrap_or(Path::new(".")));
     let log_from = fs::metadata(&server_log).map(|m| m.len()).unwrap_or(0);
-    let out = OpenOptions::new().create(true).append(true).open(&server_log)?;
+    let out = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&server_log)
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("无法写入日志目录 {} : {e}", server_log.display()),
+            )
+        })?;
     let err = out.try_clone()?;
 
     let mut cmd = Command::new("cmd.exe");
-    cmd.args(["/C", cmdline]);
+    // `raw_arg` passes the assembled command line through verbatim. Using
+    // `args(["/C", cmdline])` would escape embedded quotes as \" which cmd.exe
+    // does not understand, so a user-supplied command such as
+    // `"C:\Program Files\nodejs\npx.cmd" web` would fail to start.
+    cmd.raw_arg("/C ").raw_arg(cmdline);
     cmd.current_dir(
         env::var_os("USERPROFILE")
             .map(PathBuf::from)
@@ -665,28 +800,50 @@ fn wait_ready(
 ) -> WaitReady {
     let deadline = Instant::now() + cfg.timeout;
     let mut port_open_since: Option<Instant> = None;
+    let mut bare_probe_done = false;
+    let mut tokenless_probe_at: Option<Instant> = None;
     loop {
         if let Some(url) = find_launch_url(log_from, &cfg.url_marker) {
             if url_port(&url).is_none_or(port_open) {
-                return WaitReady::Ready(url);
+                if url.contains("token=") {
+                    // Carries this process's launch token: ready to use as is.
+                    return WaitReady::Ready(url);
+                }
+                // A dsh without token auth prints a plain URL. Accept it only
+                // when the page is really served, otherwise the browser would
+                // show a 401 page; probe at most once per grace period.
+                let now = Instant::now();
+                let due = tokenless_probe_at
+                    .map(|at| now.duration_since(at) >= LAUNCH_URL_GRACE)
+                    .unwrap_or(true);
+                if due {
+                    tokenless_probe_at = Some(now);
+                    match url_port(&url).and_then(|p| http_get(p, 4096)) {
+                        Some((200, _)) | Some((303, _)) => return WaitReady::Ready(url),
+                        Some((status, _)) => log_msg(&format!(
+                            "printed URL without a token answered {status}; still waiting for a tokenized one"
+                        )),
+                        None => {}
+                    }
+                }
             }
         }
         if let Some(port) = probe_port {
             if port_open(port) {
-                // A dsh without token auth never prints that URL; do not wait
-                // for it forever, but only accept the bare URL when it really is
-                // usable — otherwise the browser would open a 401 page.
+                // The port can be bound before the tokenized URL is printed
+                // (dsh listens first and prints it once its loader settles), so a
+                // non-usable bare URL here means "still starting", never "failed".
                 let since = *port_open_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= LAUNCH_URL_GRACE {
-                    match http_status(port) {
-                        Some(200) | Some(303) => {
+                if !bare_probe_done && since.elapsed() >= LAUNCH_URL_GRACE {
+                    bare_probe_done = true;
+                    match http_get(port, 4096) {
+                        Some((200, _)) | Some((303, _)) => {
                             log_msg("no tokenized launch URL in output; the bare URL is usable, using it");
                             return WaitReady::Ready(url_for(port));
                         }
-                        Some(status) => {
-                            log_msg(&format!("no tokenized launch URL in output and the bare URL returned {status}"));
-                            return WaitReady::NoLaunchUrl { port };
-                        }
+                        Some((status, _)) => log_msg(&format!(
+                            "bare URL on port {port} answered {status}; waiting for the tokenized launch URL"
+                        )),
                         None => {}
                     }
                 }
@@ -698,7 +855,12 @@ fn wait_ready(
             }
         }
         if Instant::now() >= deadline {
-            return WaitReady::Timeout;
+            // Something is serving the port but never printed a usable URL:
+            // that is the shape of a DSH release that changed its output.
+            return match probe_port {
+                Some(port) if port_open(port) => WaitReady::NoLaunchUrl { port },
+                _ => WaitReady::Timeout,
+            };
         }
         sleep(Duration::from_millis(300));
     }
@@ -729,12 +891,17 @@ fn chrome_path() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+/// A profile directory for this run, tagged with our pid so a later run can tell
+/// whether the directory is still owned by a live launcher before pruning it.
 fn fresh_profile_dir() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    data_dir().join("profiles").join(format!("run-{nanos}"))
+    let dir = data_dir().join("profiles").join(format!("run-{nanos}"));
+    ensure_dir(&dir);
+    let _ = fs::write(dir.join(PID_FILE_NAME), std::process::id().to_string());
+    dir
 }
 
 fn spawn_browser(url: &str, profile: &Path) -> std::io::Result<Child> {
@@ -801,17 +968,20 @@ fn wait_until_browser_closes(browser: &mut Child, mut server: Option<&mut Child>
     }
 }
 
+/// Chrome's helper processes (crashpad, GPU) can hold handles for a few seconds
+/// after the window closes, so retry for a while before giving up; anything left
+/// behind is collected by `prune_profiles` on a later run.
 fn cleanup_profile(profile: &Path) {
     if !profile.exists() {
         return;
     }
-    for _ in 0..10 {
+    for _ in 0..15 {
         match fs::remove_dir_all(profile) {
             Ok(()) => {
                 log_msg("profile dir removed");
                 return;
             }
-            Err(_) => sleep(Duration::from_millis(200)),
+            Err(_) => sleep(Duration::from_millis(500)),
         }
     }
     log_msg("profile dir cleanup deferred (files still locked)");
@@ -831,21 +1001,33 @@ fn run() -> i32 {
 
     let cfg = LaunchConfig::load();
 
+    // Housekeeping before anything else: keep the append-only logs bounded and
+    // drop profile directories that earlier runs could not delete (Chrome locks).
+    rotate_log(&log_path(), 1 << 20); // 1 MiB
+    rotate_log(&server_log_path(), 8 << 20); // 8 MiB
+    prune_profiles(Duration::from_secs(24 * 3600));
     // Reuse an existing service only when it needs no token at all (a DSH old
-    // enough not to authenticate). A token-protected one cannot be driven from
-    // outside: its token lives only in that node process.
+    // enough not to authenticate) AND it really looks like the DSH UI — an
+    // unrelated app on the preferred port must not be adopted. A token-protected
+    // DSH cannot be driven from outside: its token lives only in that process.
     let mut url: Option<String> = None;
     let mut bind_port: Option<u16> = None;
     if cfg.port != 0 {
-        match http_status(cfg.port) {
-            Some(200) | Some(303) => {
+        match http_get(cfg.port, 8192) {
+            Some((200, body)) if cfg.ui_marker.is_empty() || body.contains(&cfg.ui_marker) => {
                 log_msg(&format!(
-                    "port {} already serves the UI without a token; reusing it",
+                    "port {} already serves the DSH UI without a token; reusing it",
                     cfg.port
                 ));
                 url = Some(url_for(cfg.port));
             }
-            Some(status) => {
+            Some((200, _)) => {
+                log_msg(&format!(
+                    "port {} answers 200 but does not contain {:?}; starting a separate instance",
+                    cfg.port, cfg.ui_marker
+                ));
+            }
+            Some((status, _)) => {
                 log_msg(&format!(
                     "port {} is served but requires its own token (HTTP {status}); starting a separate instance",
                     cfg.port
@@ -894,7 +1076,7 @@ fn run() -> i32 {
                     show_message(
                         "DSH 启动器",
                         &format!(
-                            "无法启动 DSH 服务:\n{e}\n\n当前命令:{}\n(可在 {} 中修改 command)\n\n请确认已安装 Node.js 并已加入 PATH。\n\n日志:{}\n服务输出:{}\n",
+                            "无法启动 DSH 服务:\n{e}\n\n当前命令:{}\n(可在 {} 中修改 command)\n\n常见原因:\n1) 未安装 Node.js 或未加入 PATH;\n2) 日志目录不可写(见下面的服务输出路径)。\n\n日志:{}\n服务输出:{}\n",
                             attempt.cmdline,
                             cfg.path.display(),
                             log_path().display(),
@@ -1008,14 +1190,25 @@ fn run() -> i32 {
                 ),
             );
             let _ = browser.kill();
+            cleanup_profile(&profile);
             return 1;
         }
     }
 
     if own_server {
+        // Only walk the process tree while our own child is still alive: if it
+        // already exited its pid could in principle have been reused by then.
+        let still_running = server
+            .as_mut()
+            .map(|s| s.try_wait().unwrap_or(None).is_none())
+            .unwrap_or(false);
         if let Some(pid) = server_pid {
-            log_msg(&format!("stopping server tree (pid {pid})"));
-            kill_tree(pid);
+            if still_running {
+                log_msg(&format!("stopping server tree (pid {pid})"));
+                kill_tree(pid);
+            } else {
+                log_msg("server had already exited; nothing to stop");
+            }
         }
         drop(job); // kill-on-close terminates anything still in the job
         if let Some(mut s) = server {

@@ -65,22 +65,44 @@ target\release\dsh-launcher.exe
 command = npx --yes @deepseek-ai/dsh web    # 启动命令
 extra_args = --no-open                      # 首次尝试附加的参数
 port = 3080                                 # 首选端口;0 = 总让 dsh 自己挑
+ui_marker = DeepSeek Harness                # 复用已有页面时必须包含的文字
 url_marker = dsh web:                       # 输出中标记网页地址的文字
 timeout_secs = 300                          # 就绪等待上限
 ```
 
 也可以用环境变量 `DSH_LAUNCHER_CONFIG` 指定配置文件路径。
 
+> `ui_marker` 是防误用的保险:首选端口上若有**别的**本地网页程序(而不是 DSH),它即使返回 200
+> 也不会被采用,启动器会另起自己的实例。把它设为空值则恢复"任何 200 都复用"的宽松行为。
+
 ## 行为细节
 
 | 场景 | 程序行为 |
 | --- | --- |
 | 首选端口空闲 | 启动 `npx --yes @deepseek-ai/dsh web --no-open --port 3080` → 读它打印的带令牌 URL → 打开全新 Chrome 窗口 |
-| 首选端口上是**老版本**(无需令牌)的服务 | **直接复用**该服务,只开浏览器;关窗后程序退出,**不结束**那个服务 |
-| 首选端口上是**新版本**(需令牌)或其它程序 | 改用 `--port 0` 让系统给一个空闲端口,启动**自己的** dsh web;关窗后只结束自己启动的服务 |
+| 首选端口上是**老版本**(无需令牌)的 DSH | **直接复用**该服务,只开浏览器;关窗后程序退出,**不结束**那个服务 |
+| 首选端口上是**别的网页程序**(非 DSH) | 识别出它不像 DSH → 改用 `--port 0` 另起自己的实例,**不采用也不结束**那个程序 |
+| 首选端口上是**新版本**(需令牌)的 DSH | 改用 `--port 0` 让系统给一个空闲端口,启动**自己的** dsh web;关窗后只结束自己启动的服务 |
 | 双击时已有实例在运行 | 单实例锁生效,第二个实例直接退出 |
 | 用户关闭打开的 Chrome 窗口 | 结束自己启动的 dsh web 进程树 → 清理临时配置 → 程序退出 |
 | Node.js 缺失 / Chrome 缺失 / 启动失败 / 超时 | 中文错误框 + 详细日志指引 + 提示可修改的配置项 |
+
+## Windows 10 / 11 兼容性
+
+- **支持范围**:Windows 10(x64)与 Windows 11(x64)。程序为 **64 位**构建,32 位 Windows
+  不支持;Windows 11 on ARM 可通过系统自带的 x64 模拟运行。
+- **只用系统自带 API**:命名互斥量、Job Object(作业对象)、`MessageBoxW` 都是 Windows 7/8
+  起就存在的接口,不依赖任何 Windows 11 专属特性。
+- **单文件、零运行时依赖**:不需要安装 .NET、VC++ 运行库或任何 DLL(Rust MSVC 静态链接)。
+- **首次运行会有 SmartScreen 提示**:从浏览器下载的未签名 exe 会显示"Windows 已保护你的电脑",
+  点"更多信息"→"仍要运行"即可。若被安全软件拦截,需要自行放行——程序只做三件事:执行
+  `npx … dsh web`、启动 Chrome、按 pid 结束**自己启动的**进程树。
+- **前置条件**:Node.js(含 `npx`)与 Google Chrome;两者在 Windows 10/11 上均正常支持。
+- **中文/非 ASCII 路径没问题**:exe 路径、`%LOCALAPPDATA%`(如 `C:\Users\中文名\…`)都以
+  UTF-16 传递给系统调用;配置文件是 UTF-8,万一被另存成 ANSI 也只是回退默认值,不会崩。
+- **多用户/多会话**:单实例锁按登录会话隔离,不同 Windows 用户各自双击互不干扰。
+- **实测情况**:在 Windows 11(build 26200,x64)上通过 26 项端到端回归;Windows 10 未能在
+  本机实测,但所用 API 与依赖均为 Windows 10 起可用,无版本专属调用。
 
 ## 从源码构建(零第三方依赖,可离线)
 
@@ -94,7 +116,7 @@ cargo build --release --offline   # 或强制离线
 
 ## 回归测试
 
-无单元测试;用 `scripts/regression.ps1` 跑三套端到端场景(先 `cargo build --release`):
+无单元测试;用 `scripts/regression.ps1` 跑五套端到端场景、共 32 项判据(先 `cargo build --release`):
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
@@ -102,7 +124,9 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
 
 - **A** 首选端口空闲 → 启动器应自己起服务、读到带令牌 URL、关窗后停服务并释放端口
 - **B** 首选端口已被**带令牌**的 dsh 占用 → 应改用 `--port 0` 另起实例,且原服务毫发无损
-- **C** 首选端口已被**无需令牌**的服务占用 → 应直接复用,不另起、不结束它
+- **C** 首选端口已被**无需令牌、且看起来就是 DSH** 的页面占用 → 应直接复用,不另起、不结束它
+- **D** 首选端口已被**无关的网页程序**占用 → 应拒绝采用它(即使返回 200),改用 `--port 0` 另起实例
+- **E** 服务先绑端口、先回 401、**几秒后才**打印带令牌 URL(真实 dsh 的启动顺序)→ 启动器应继续等待而不是误判失败并杀掉它
 
 脚本借助 `DSH_*` 测试开关运行,因此可以与本机正在使用的启动器实例并存。
 

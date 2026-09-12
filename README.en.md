@@ -68,11 +68,16 @@ writable). Plain text with comments; changes apply immediately:
 command = npx --yes @deepseek-ai/dsh web    # how to start the UI
 extra_args = --no-open                      # arguments for the first attempt
 port = 3080                                 # preferred port; 0 = always let dsh choose
+ui_marker = DeepSeek Harness                # text a reusable page must contain
 url_marker = dsh web:                       # text that marks the line carrying the URL
 timeout_secs = 300                          # readiness timeout
 ```
 
 The environment variable `DSH_LAUNCHER_CONFIG` can point at a different config file.
+
+> `ui_marker` guards against adopting the wrong thing: if the preferred port is held by some *other*
+> local web app, that page is not reused even when it answers 200 — the launcher starts its own
+> instance instead. Set it to an empty value to restore the loose "any 200 will do" behaviour.
 
 ## Behavior in detail
 
@@ -80,10 +85,33 @@ The environment variable `DSH_LAUNCHER_CONFIG` can point at a different config f
 | --- | --- |
 | Preferred port is free | Starts `npx --yes @deepseek-ai/dsh web --no-open --port 3080`, reads the tokenized URL it prints, opens a fresh Chrome window |
 | Preferred port serves an **older** DSH (no token) | **Reuses** that service and only opens the browser; on window close it exits and **leaves that service running** |
-| Preferred port serves a **token-protected** DSH or anything else | Starts its **own** dsh web with `--port 0` (OS-assigned free port); on window close it stops only its own service |
+| Preferred port serves an **unrelated web app** | Recognises it is not the DSH UI and starts its **own** instance with `--port 0`; that app is neither adopted nor killed |
+| Preferred port serves a **token-protected** DSH | Starts its **own** dsh web with `--port 0` (OS-assigned free port); on window close it stops only its own service |
 | Another launcher is already running | The single-instance lock makes the second copy exit immediately |
 | You close the Chrome window | Ends the dsh web process tree it started → removes the throwaway profile → exits |
 | Node.js or Chrome missing, startup failure, timeout | Message box + detailed log paths + the config keys to change |
+
+## Windows 10 / 11 compatibility
+
+- **Supported**: Windows 10 (x64) and Windows 11 (x64). The binary is **64-bit**; 32-bit Windows is
+  not supported. Windows 11 on ARM runs it through the built-in x64 emulation.
+- **Only built-in APIs**: the named mutex, Job Objects and `MessageBoxW` have existed since
+  Windows 7/8 — nothing depends on a Windows 11-only feature.
+- **Single file, no runtime prerequisites**: no .NET, no VC++ redistributable, no DLLs (Rust MSVC
+  links statically).
+- **The first launch shows a SmartScreen prompt**: an unsigned exe downloaded from the internet
+  triggers "Windows protected your PC" — pick *More info* → *Run anyway*. If your antivirus blocks
+  it, allow it explicitly; the program only does three things: run `npx … dsh web`, start Chrome, and
+  end the process tree **it started**, by pid.
+- **Requirements**: Node.js (with `npx`) and Google Chrome, both fully supported on Windows 10/11.
+- **Unicode paths are fine**: the exe path and `%LOCALAPPDATA%` (e.g. `C:\Users\中文名\…`) are passed
+  as UTF-16; the config file is UTF-8, and if it is ever re-saved as ANSI the launcher simply falls
+  back to the defaults instead of failing.
+- **Multiple users/sessions**: the single-instance lock is per logon session, so different Windows
+  users can each double-click their own copy without interfering.
+- **What was actually tested**: 26 end-to-end regression checks pass on Windows 11 (build 26200,
+  x64). Windows 10 was not available on this machine, but every API and dependency used has been
+  available since Windows 10.
 
 ## Building from source (zero dependencies, offline-friendly)
 
@@ -97,7 +125,7 @@ cargo build --release --offline   # or force offline
 
 ## Regression tests
 
-There are no unit tests; `scripts/regression.ps1` runs three end-to-end scenarios
+There are no unit tests; `scripts/regression.ps1` runs five end-to-end scenarios with 32 checks
 (`cargo build --release` first):
 
 ```powershell
@@ -108,8 +136,12 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
   service and releases the port when the window closes
 - **B** preferred port taken by a **token-protected** dsh → the launcher falls back to `--port 0` and
   leaves the other service untouched
-- **C** preferred port taken by a **token-less** service → the launcher reuses it, starts nothing and
-  kills nothing
+- **C** preferred port taken by a token-less page that **looks like the DSH UI** → the launcher reuses
+  it, starts nothing and kills nothing
+- **D** preferred port taken by an **unrelated web app** → the launcher refuses to adopt it (even
+  though it answers 200) and starts its own instance with `--port 0`
+- **E** a server binds the port early and answers 401, printing its tokenized URL only seconds later
+  (the real dsh startup order) → the launcher must keep waiting instead of failing and killing it
 
 The script runs through `DSH_*` test switches, so it can run side by side with a launcher you are
 already using.
