@@ -450,13 +450,15 @@ impl LaunchConfig {
         }
 
         log_msg(&format!(
-            "config {}: command={:?} extra_args=[{}] port={} url_marker={:?} timeout={}s",
+            "config {}: command={:?} extra_args=[{}] port={} ui_marker={:?} url_marker={:?} timeout={}s window_mode={}",
             path.display(),
             cfg.command,
             cfg.extra_args.join(" "),
             cfg.port,
+            cfg.ui_marker,
             cfg.url_marker,
-            cfg.timeout.as_secs()
+            cfg.timeout.as_secs(),
+            if cfg.app_window { "app" } else { "normal" }
         ));
         cfg
     }
@@ -1017,6 +1019,12 @@ fn run() -> i32 {
     log_msg("=== DSH launcher start ===");
 
     let Some(_single) = SingleInstance::acquire() else {
+        // Another copy already manages a DSH window. Exiting silently would look
+        // like "double-clicking does nothing", which is exactly how users read it.
+        show_message(
+            "DSH 启动器",
+            "启动器已经在运行了。\n\n它打开的 DSH 窗口就是现在这个。要重新启动(例如换了新版程序),请先关闭那个窗口——这也会停止它启动的服务——然后再双击本程序。",
+        );
         return 0;
     };
 
