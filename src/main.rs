@@ -273,6 +273,39 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// Chrome offers to "install" the DSH page as an app (the blue Install chip in
+/// the address bar) because the DSH web UI ships a web app manifest. This
+/// launcher's Chrome profile is thrown away when the window closes, so
+/// installing into it is pointless — block the installation content setting up
+/// front by seeding the profile's preferences before Chrome starts.
+///
+/// The keys are the ones Chrome itself uses for Settings → Site settings →
+/// "Web app installation"; `2` is BLOCK. Best effort: if a Chrome release stops
+/// honouring them the chip simply comes back, nothing else breaks.
+fn seed_chrome_prefs(profile: &Path, block_web_app_install: bool) {
+    let default_dir = profile.join("Default");
+    ensure_dir(&default_dir);
+    let prefs_path = default_dir.join("Preferences");
+    if prefs_path.exists() {
+        return;
+    }
+    let prefs = if block_web_app_install {
+        concat!(
+            r#"{"profile":{"default_content_setting_values":{"web_app_installation":2},"#,
+            r#""content_settings":{"exceptions":{"web_app_installation":{"*,*":{"setting":2}}}}}}"#
+        )
+    } else {
+        "{}"
+    };
+    match fs::write(&prefs_path, prefs) {
+        Ok(()) if block_web_app_install => {
+            log_msg("seeded Chrome prefs: web app installation blocked (no Install chip)")
+        }
+        Ok(()) => {}
+        Err(e) => log_msg(&format!("could not seed Chrome prefs: {e}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // configuration
 //
@@ -309,6 +342,12 @@ url_marker = dsh web:
 
 # How long to wait for the server to become ready, in seconds.
 timeout_secs = 300
+
+# The DSH web UI ships a web app manifest, so Chrome adds an Install chip to the
+# address bar. The launcher's Chrome profile is temporary (deleted when the
+# window closes), so installing into it is pointless: true blocks that content
+# setting before Chrome starts. Set false to get the Install chip back.
+block_web_app_install = true
 ";
 
 struct LaunchConfig {
@@ -318,6 +357,7 @@ struct LaunchConfig {
     ui_marker: String,
     url_marker: String,
     timeout: Duration,
+    block_web_app_install: bool,
     /// True when DSH_SERVER_EXTRA replaced the command: the launcher then runs
     /// that command verbatim (regression scenarios rely on this).
     test_command: bool,
@@ -333,6 +373,7 @@ impl Default for LaunchConfig {
             ui_marker: "DeepSeek Harness".to_string(),
             url_marker: "dsh web:".to_string(),
             timeout: Duration::from_secs(300),
+            block_web_app_install: true,
             test_command: false,
             path: PathBuf::new(),
         }
@@ -410,6 +451,11 @@ impl LaunchConfig {
                         "timeout_secs" => match value.parse::<u64>() {
                             Ok(s) => cfg.timeout = Duration::from_secs(s),
                             Err(_) => log_msg(&format!("config: bad timeout_secs {value:?}")),
+                        },
+                        "block_web_app_install" => match value.to_ascii_lowercase().as_str() {
+                            "true" | "1" | "yes" | "on" => cfg.block_web_app_install = true,
+                            "false" | "0" | "no" | "off" => cfg.block_web_app_install = false,
+                            _ => log_msg(&format!("config: bad block_web_app_install {value:?}")),
                         },
                         _ => log_msg(&format!("config: ignoring unknown key {key:?}")),
                     }
@@ -904,7 +950,7 @@ fn fresh_profile_dir() -> PathBuf {
     dir
 }
 
-fn spawn_browser(url: &str, profile: &Path) -> std::io::Result<Child> {
+fn spawn_browser(url: &str, profile: &Path, block_web_app_install: bool) -> std::io::Result<Child> {
     // Fake chrome (tests): pings loopback for a while, then "closes".
     if let Ok(v) = env::var("DSH_FAKE_CHROME") {
         if let Ok(secs) = v.parse::<u64>() {
@@ -927,6 +973,8 @@ fn spawn_browser(url: &str, profile: &Path) -> std::io::Result<Child> {
         return Err(std::io::Error::other("Chrome not found"));
     };
     ensure_dir(profile);
+    // Must happen before Chrome starts: it reads the profile's preferences once.
+    seed_chrome_prefs(profile, block_web_app_install);
     log_msg(&format!("opening {url} with chrome: {}", chrome.display()));
     // A fresh dedicated profile dir means this is a brand-new, isolated Chrome
     // instance: its window opens with ONLY the DSH page — no bookmarks,
@@ -1159,7 +1207,7 @@ fn run() -> i32 {
     };
 
     let profile = fresh_profile_dir();
-    let mut browser = match spawn_browser(&url, &profile) {
+    let mut browser = match spawn_browser(&url, &profile, cfg.block_web_app_install) {
         Ok(b) => b,
         Err(e) => {
             log_msg(&format!("failed to open browser: {e}"));

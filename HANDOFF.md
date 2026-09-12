@@ -52,12 +52,19 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
 5. **Important**:配置非 UTF-8(记事本 ANSI)时静默失效。现改为按字节读 + 去 UTF-8 BOM +
    `from_utf8_lossy`,ASCII 键值仍可用。
 6. **Important**:仓库根目录的便捷 exe 是 1.0 旧版(308,224 字节,且被运行中实例锁定无法覆盖)。
-   新版为 `target\release\dsh-launcher.exe`(1.2.0);已额外复制一份到**仓库外**
-   `K:\BaiduSyncdisk\Rust\dsh\dsh-launcher-1.2.0.exe` 供直接双击,根目录旧副本待实例关闭后覆盖。
+   新版为 `target\release\dsh-launcher.exe`(1.3.0);已额外复制一份到**仓库外**
+   `K:\BaiduSyncdisk\Rust\dsh\dsh-launcher-1.3.0.exe` 供直接双击,根目录旧副本待实例关闭后覆盖。
 7. **Minor**:回退链第 2 档原会丢掉 `--port`(dsh 默认 3080,正是用户最可能占用的端口)。现改为
    "完整命令 → 命令 + `--port 0` → 仅命令";日志读改 seek(不再整文件读);启动失败弹窗补充
    "日志目录不可写"这一可能;`build.rs` 的 rc.exe 探测重写(SDK 目录/PATH)、加 `/c 65001`
    (项目路径含中文也能嵌图标)、修正文案笔误。
+8. **用户反馈:地址栏出现蓝色"安装"图标**。根因是 DSH 前端自带
+   `dsh-web-frontend/dist/manifest.webmanifest`(`display: fullscreen`),Chrome 判定页面"可安装"。
+   启动器打开的 profile 是临时的、关窗即删,安装没有意义,因此新增 `seed_chrome_prefs`:在 Chrome
+   启动前写入该 profile 的 `Default\Preferences`
+   (`profile.default_content_setting_values.web_app_installation = 2`,即"Web 应用安装 = 阻止")。
+   已用 headless Chrome 实测该键被 Chrome 保留(156 → 9005 字节,与自身默认合并),说明它被认可;
+   配置项 `block_web_app_install = false` 可恢复图标。**没有**去改 DSH 的前端文件。
 ## 下一步 TODO
 
 1. 关掉正在运行的实例后,**手动**把 `target\release\dsh-launcher.exe` 覆盖到仓库根目录的便捷副本

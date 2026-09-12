@@ -91,6 +91,12 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
   专门盯这条。
 - **配置文件模板只写 ASCII**:用户会用记事本编辑 `dsh-launcher.conf`,若模板含中文注释而用户另存为
   ANSI,就得靠 `String::from_utf8_lossy` + 去 BOM 兜底(已实现)。新增模板文字请保持 ASCII。
+- **地址栏的"安装"图标源自 DSH 自带的 manifest**:`dsh-web-frontend/dist/manifest.webmanifest` 让页面成为
+  "可安装的 Web 应用",Chrome 于是在地址栏加安装入口。启动器打开的 profile 是临时的(关窗即删),装在那里
+  没有意义,因此 `seed_chrome_prefs` 在 Chrome 启动前把该 profile 的
+  `profile.default_content_setting_values.web_app_installation = 2`(阻止)写进 `Default\Preferences`
+  —— 与 Chrome 设置里的"Web 应用安装"同一项,已实测 Chrome 会保留该键。配置项
+  `block_web_app_install = false` 可关闭。**不要**去改 DSH 的前端文件来达到这个目的。
 - 注释与标识符用英文,面向用户的文案用中文。
 - 保持 `src/main.rs` 现有写法:单文件、`fn` 按主流程顺序排布、少抽象。
 

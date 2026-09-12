@@ -71,6 +71,7 @@ port = 3080                                 # preferred port; 0 = always let dsh
 ui_marker = DeepSeek Harness                # text a reusable page must contain
 url_marker = dsh web:                       # text that marks the line carrying the URL
 timeout_secs = 300                          # readiness timeout
+block_web_app_install = true                # remove the address-bar Install chip
 ```
 
 The environment variable `DSH_LAUNCHER_CONFIG` can point at a different config file.
@@ -78,6 +79,12 @@ The environment variable `DSH_LAUNCHER_CONFIG` can point at a different config f
 > `ui_marker` guards against adopting the wrong thing: if the preferred port is held by some *other*
 > local web app, that page is not reused even when it answers 200 — the launcher starts its own
 > instance instead. Set it to an empty value to restore the loose "any 200 will do" behaviour.
+>
+> `block_web_app_install` removes the blue **Install** chip Chrome shows in the address bar. The DSH
+> page ships a `manifest.webmanifest` (an installable web app), so Chrome offers to install it. The
+> launcher's Chrome profile is temporary and deleted when the window closes, so installing into it is
+> pointless — the profile's "Web app installation" setting is therefore blocked before Chrome starts.
+> Set it to `false` to bring the chip back.
 
 ## Behavior in detail
 
@@ -173,6 +180,7 @@ Every failure points at the logs in its message box:
 | "could not obtain an access token" | A DSH release changed the output format: check `url_marker` in the config file |
 | Startup times out | Inspect `server.log`, or run the configured `command` in a terminal; raise `timeout_secs` if needed |
 | Two browser windows appear | Make sure you run the latest build (older builds lacked `--no-open`, so dsh opened a browser itself) |
+| A blue **Install** chip in the address bar | Chrome considers the DSH page installable because it ships a Web App Manifest. The launcher's own window already blocks it; in your everyday Chrome you can block it under Settings → Privacy and security → Site settings → Additional content settings → "Web app installation", or simply ignore it |
 
 ## Repository layout
 
@@ -180,8 +188,9 @@ Every failure points at the logs in its message box:
 dsh-launcher/
 ├─ assets/icon.ico              # application icon (multi-size)
 ├─ scripts/gen_icon.ps1         # icon generator
-├─ scripts/regression.ps1       # end-to-end regression scenarios A/B/C
-├─ scripts/test-stub-server.ps1 # token-less stub service used by scenario C
+├─ scripts/regression.ps1       # end-to-end regression scenarios A-E (32 checks)
+├─ scripts/test-stub-server.ps1 # stub services used by scenarios C/D
+├─ scripts/test-slow-server.ps1 # late-tokenized-URL service used by scenario E
 ├─ build.rs                     # zero-dependency icon embedding (rc.exe)
 ├─ src/main.rs                  # the whole program (std + a little hand-written Win32 FFI)
 ├─ AGENTS.md / HANDOFF.md       # project conventions / handoff notes (Chinese)
