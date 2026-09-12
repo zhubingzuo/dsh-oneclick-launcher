@@ -1,5 +1,10 @@
 # DSH One-Click Launcher(DeepSeek Harness 一键启动器)
 
+[![Release](https://img.shields.io/github/v/release/zhubingzuo/dsh-oneclick-launcher)](https://github.com/zhubingzuo/dsh-oneclick-launcher/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+**简体中文** | [English](README.en.md)
+
 一个 **Windows 双击即用**的启动器:静默启动 DeepSeek Harness 网页版,打开一个
 **全新的干净 Chrome 窗口**进入 DSH 页面,全程**不弹出任何黑色命令提示符窗口**;
 关闭该 Chrome 窗口后自动停止后台服务并退出,不留残留进程。
@@ -10,9 +15,10 @@
 > 设计目标是**跟随 DSH 版本演进**:地址从 dsh 自己的输出里读(不猜端口、不硬编码 URL),
 > 启动方式写在可编辑的配置文件里——常规的 DSH 更新**不需要重新编译**本启动器。
 
-## 成品位置
+## 下载 / 成品位置
 
-双击运行(Release 版,已内嵌程序图标,无控制台窗口):
+从 [最新 Release](https://github.com/zhubingzuo/dsh-oneclick-launcher/releases/latest) 直接下载
+`dsh-launcher.exe`,或自行构建(见 [从源码构建](#从源码构建零第三方依赖可离线)):
 
 ```
 target\release\dsh-launcher.exe
@@ -140,7 +146,9 @@ dsh-launcher/
 ├─ src/main.rs                  # 主程序(纯 std + 少量手写 Win32 FFI)
 ├─ AGENTS.md / HANDOFF.md       # 项目约定 / 交接说明
 ├─ Cargo.toml / Cargo.lock
-└─ README.md
+├─ LICENSE
+├─ README.md                    # 简体中文(本文件)
+└─ README.en.md                 # English
 ```
 
 ## 内部测试开关(普通使用无需关心)
@@ -156,6 +164,11 @@ dsh-launcher/
 | `DSH_READY_TIMEOUT_SECS` | 覆盖就绪等待秒数 |
 | `DSH_CHROME` | 指定 chrome.exe 路径 |
 | `DSH_SKIP_SINGLE_INSTANCE` | `1` 时跳过单实例检查(便于与正在运行的实例并存跑回归) |
+
+## 声明
+
+本项目是 DSH 的**非官方**启动器,与 DeepSeek 官方无隶属关系;
+DeepSeek Harness 及其图标等权利归其原始权利人所有。
 
 ## 许可证
 
