@@ -50,8 +50,9 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
 
 1. 关掉正在运行的实例后,**手动**把 `target\release\dsh-launcher.exe` 覆盖到仓库根目录的
    便捷副本 `dsh-launcher.exe`(该副本当前被运行中的实例锁定,仍是 1.0 时代的旧版)。
-2. `f03321e` 需要 `git push` 到 `origin/main`(此前 `c4601f4`、`8eb0b9d` 也尚未推送)。
-   推送后可在 GitHub 建 Release 并把 exe 作为附件,方便直接下载。
+2. 已推送 `f03321e`/`643154f` 到 `origin/main`(本地与远端一致),并已建 Release
+   `v1.1.0`(附件 `dsh-launcher.exe`,308224 字节)。后续发新版时:改 `Cargo.toml` 版本 →
+   构建 → 提交推送 → 用同样的方式建 tag/Release。
 3. 若某版 dsh 既不打印带 token 的 URL、裸地址又不可用,现在会明确报错并指向 `url_marker`
    (旧行为是"5 秒宽限后回落裸地址"),这是有意为之,不要改回静默回落。
 4. 可选的下一步演进:把"复用无令牌服务"的判断从 `GET /` 扩展到更明确的能力探测;
@@ -79,4 +80,5 @@ f03321e  feat: 抗 DSH 版本变化的启动方式(外部配置 + 复用已有�
 c4601f4  修复:用 dsh 打印的 token URL 打开浏览器,并修正 DSH_PORT 与端口占用处理
 316498c  Initial release: DSH one-click launcher for Windows
 ```
-`origin/main` 目前仍停在 `316498c`,以上三个提交都还没推送。
+`origin/main` 已与本地一致(最新 `643154f`);GitHub Release:
+<https://github.com/zhubingzuo/dsh-oneclick-launcher/releases/tag/v1.1.0>
