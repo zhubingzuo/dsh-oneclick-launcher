@@ -1,26 +1,34 @@
 //! DSH Launcher — one-click launcher for DeepSeek Harness (Windows).
 //!
 //! Behavior:
-//! 1. If nothing is listening on 127.0.0.1:PORT yet, quietly start
-//!    `npx @deepseek-ai/dsh web` with no console window ever visible.
-//! 2. Poll until the server accepts TCP connections on the port.
-//! 3. Open a fresh Chrome window (isolated temporary profile) at
-//!    http://127.0.0.1:PORT/ and stay alive silently.
-//! 4. When that Chrome window is closed, stop the server process tree and
-//!    exit. A server that was already running before launch is left alone.
+//! 1. If the preferred port already serves a usable DSH UI (no token needed),
+//!    reuse it and just open the browser.
+//! 2. Otherwise start `npx @deepseek-ai/dsh web` with no console window ever
+//!    visible, and read the tokenized launch URL from its output.
+//! 3. Open a fresh Chrome window (isolated temporary profile) at that URL and
+//!    stay alive silently.
+//! 4. When that Chrome window is closed, stop the server process tree and exit.
+//!    A service that was already running before launch is left alone.
+//!
+//! Nothing about DSH's CLI is hard-coded beyond editable defaults: the command,
+//! its extra arguments, the preferred port, the output marker that carries the
+//! launch URL and the readiness timeout all come from `dsh-launcher.conf` next
+//! to the exe (see `CONFIG_TEMPLATE`), and every launch step has a fallback so a
+//! DSH update normally needs no rebuild.
 //!
 //! Zero external dependencies: the few Win32 functions we need
 //! (job objects, mutex, message box) are declared as raw `extern "system"`.
 //!
 //! Test-only knobs (see README): DSH_DATA_DIR, DSH_PORT, DSH_SERVER_EXTRA,
-//! DSH_FAKE_CHROME, DSH_NO_UI, DSH_READY_TIMEOUT_SECS, DSH_CHROME.
+//! DSH_FAKE_CHROME, DSH_NO_UI, DSH_READY_TIMEOUT_SECS, DSH_CHROME,
+//! DSH_LAUNCHER_CONFIG.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
 use std::ffi::c_void;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
@@ -31,6 +39,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DEFAULT_PORT: u16 = 3080;
+const CONFIG_FILE_NAME: &str = "dsh-launcher.conf";
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9; // JobObjectExtendedLimitInformation
 const ERROR_ALREADY_EXISTS: u32 = 183;
@@ -188,7 +197,169 @@ fn read_tail(path: &Path, max_bytes: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// environment helpers
+// configuration
+//
+// Everything about how DSH is started lives here, so a future DSH release can
+// be accommodated by editing a text file instead of rebuilding the launcher:
+// the built-in values below are only defaults.
+// ---------------------------------------------------------------------------
+
+const CONFIG_TEMPLATE: &str = "\
+# dsh-launcher configuration — every entry is optional.
+# The values below are the built-in defaults; delete this file to restore them.
+# Edit this file (no rebuild needed) when a DSH release changes its CLI.
+
+# Command that serves the DSH web UI. The launcher appends the port argument.
+command = npx --yes @deepseek-ai/dsh web
+
+# Extra arguments for the first launch attempt (space separated).
+# --no-open keeps dsh from opening a browser of its own.
+extra_args = --no-open
+
+# Preferred port. If something without a token already serves it, that service
+# is reused; if it is busy, the launcher starts its own instance on a free port.
+# Use 0 to always let dsh pick a free port.
+port = 3080
+
+# Text that marks the line of dsh output carrying the launch URL; the first
+# http(s) URL after it is handed to the browser.
+url_marker = dsh web:
+
+# How long to wait for the server to become ready, in seconds.
+timeout_secs = 300
+";
+
+struct LaunchConfig {
+    command: String,
+    extra_args: Vec<String>,
+    port: u16,
+    url_marker: String,
+    timeout: Duration,
+    /// True when DSH_SERVER_EXTRA replaced the command: the launcher then runs
+    /// that command verbatim (regression scenarios rely on this).
+    test_command: bool,
+    path: PathBuf,
+}
+
+impl Default for LaunchConfig {
+    fn default() -> Self {
+        LaunchConfig {
+            command: "npx --yes @deepseek-ai/dsh web".to_string(),
+            extra_args: vec!["--no-open".to_string()],
+            port: DEFAULT_PORT,
+            url_marker: "dsh web:".to_string(),
+            timeout: Duration::from_secs(300),
+            test_command: false,
+            path: PathBuf::new(),
+        }
+    }
+}
+
+/// `DSH_LAUNCHER_CONFIG` wins; otherwise `<exe dir>\dsh-launcher.conf` is used
+/// and created from the template on first run; if the exe directory is not
+/// writable the config lives in the data directory instead.
+fn config_path() -> PathBuf {
+    if let Ok(p) = env::var("DSH_LAUNCHER_CONFIG") {
+        if !p.is_empty() {
+            if let Some(dir) = Path::new(&p).parent() {
+                ensure_dir(dir);
+            }
+            if !Path::new(&p).exists() {
+                let _ = fs::write(&p, CONFIG_TEMPLATE);
+            }
+            return PathBuf::from(p);
+        }
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(CONFIG_FILE_NAME);
+            if candidate.exists() {
+                return candidate;
+            }
+            if fs::write(&candidate, CONFIG_TEMPLATE).is_ok() {
+                log_msg(&format!("wrote default config: {}", candidate.display()));
+                return candidate;
+            }
+            log_msg(&format!("cannot write {}; using the data directory", candidate.display()));
+        }
+    }
+    let fallback = data_dir().join(CONFIG_FILE_NAME);
+    if !fallback.exists() {
+        ensure_dir(&data_dir());
+        let _ = fs::write(&fallback, CONFIG_TEMPLATE);
+    }
+    fallback
+}
+
+impl LaunchConfig {
+    fn load() -> LaunchConfig {
+        let path = config_path();
+        let mut cfg = LaunchConfig { path: path.clone(), ..LaunchConfig::default() };
+
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let Some((key, value)) = line.split_once('=') else { continue };
+                    let key = key.trim();
+                    let value = value.trim();
+                    match key {
+                        "command" if !value.is_empty() => cfg.command = value.to_string(),
+                        "extra_args" => {
+                            cfg.extra_args = value.split_whitespace().map(str::to_string).collect()
+                        }
+                        "port" => match value.parse() {
+                            Ok(p) => cfg.port = p,
+                            Err(_) => log_msg(&format!("config: bad port {value:?}; keeping {}", cfg.port)),
+                        },
+                        "url_marker" => cfg.url_marker = value.to_string(),
+                        "timeout_secs" => match value.parse::<u64>() {
+                            Ok(s) => cfg.timeout = Duration::from_secs(s),
+                            Err(_) => log_msg(&format!("config: bad timeout_secs {value:?}")),
+                        },
+                        _ => log_msg(&format!("config: ignoring unknown key {key:?}")),
+                    }
+                }
+            }
+            Err(e) => log_msg(&format!("config {} unreadable ({e}); using defaults", path.display())),
+        }
+
+        // Environment overrides, used by the regression scenarios.
+        if let Ok(v) = env::var("DSH_PORT") {
+            if let Ok(p) = v.parse() {
+                cfg.port = p;
+            }
+        }
+        if let Ok(v) = env::var("DSH_READY_TIMEOUT_SECS") {
+            if let Ok(s) = v.parse::<u64>() {
+                cfg.timeout = Duration::from_secs(s);
+            }
+        }
+        if let Ok(v) = env::var("DSH_SERVER_EXTRA") {
+            if !v.trim().is_empty() {
+                cfg.command = v;
+                cfg.test_command = true;
+            }
+        }
+
+        log_msg(&format!(
+            "config {}: command={:?} extra_args=[{}] port={} url_marker={:?} timeout={}s",
+            path.display(),
+            cfg.command,
+            cfg.extra_args.join(" "),
+            cfg.port,
+            cfg.url_marker,
+            cfg.timeout.as_secs()
+        ));
+        cfg
+    }
+}
+
+// ---------------------------------------------------------------------------
+// launch URL discovery
 // ---------------------------------------------------------------------------
 
 /// The tokenized URL `dsh web` prints on stdout. This is the only place its
@@ -197,23 +368,36 @@ fn read_tail(path: &Path, max_bytes: usize) -> String {
 /// URL is rejected (401) unless a `dsh-auth-*` cookie was already minted from
 /// it. Scanning only bytes appended after `from_offset` keeps a stale token from
 /// a previous run from being reused.
-fn find_launch_url(from_offset: u64) -> Option<String> {
-    const PREFIX: &str = "http://127.0.0.1:";
-    const TOKEN_SUFFIX: &str = "/?token=";
+///
+/// Two independent shapes are accepted so a renamed marker or a reshaped URL
+/// does not break the launcher: the configured `marker` line first, then any
+/// loopback URL that carries a token query anywhere in this run's output.
+fn find_launch_url(from_offset: u64, marker: &str) -> Option<String> {
     let bytes = fs::read(server_log_path()).ok()?;
     let start = (from_offset as usize).min(bytes.len());
     let text = String::from_utf8_lossy(&bytes[start..]);
-    for line in text.lines() {
-        let Some(at) = line.find(PREFIX) else { continue };
-        let rest = &line[at..];
-        let Some(token_at) = rest.find(TOKEN_SUFFIX) else { continue };
-        let digits = &rest[PREFIX.len()..token_at];
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
+
+    let strip = |tok: &str| tok.trim_end_matches([')', ',', '.']).to_string();
+
+    if !marker.is_empty() {
+        for line in text.lines() {
+            let Some(at) = line.find(marker) else { continue };
+            for token in line[at + marker.len()..].split_whitespace() {
+                let url = strip(token);
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    return Some(url);
+                }
+            }
         }
-        let url = rest.split_whitespace().next().unwrap_or_default();
-        if url.len() > token_at + TOKEN_SUFFIX.len() {
-            return Some(url.to_string());
+    }
+
+    for line in text.lines() {
+        for token in line.split_whitespace() {
+            let url = strip(token);
+            let loopback = url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:");
+            if loopback && (url.contains("?token=") || url.contains("&token=")) {
+                return Some(url);
+            }
         }
     }
     None
@@ -223,20 +407,30 @@ fn find_launch_url(from_offset: u64) -> Option<String> {
 /// whichever port dsh actually bound, which is only known from its URL when it
 /// was allowed to pick one itself (`--port 0`).
 fn url_port(url: &str) -> Option<u16> {
-    url.strip_prefix("http://127.0.0.1:")?.split('/').next()?.parse().ok()
+    let rest = url
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| url.strip_prefix("http://localhost:"))?;
+    rest.split(['/', '?']).next()?.parse().ok()
 }
 
-fn port_from_env() -> u16 {
-    env::var("DSH_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_PORT)
+/// Status code of `GET /` on the port, or `None` when nothing answers HTTP.
+fn http_status(port: u16) -> Option<u16> {
+    let mut stream = TcpStream::connect_timeout(&addr_for(port), Duration::from_millis(600)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: dsh-launcher\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).ok()?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.lines().next()?.split_whitespace().nth(1)?.parse().ok()
 }
 
-fn ready_timeout() -> Duration {
-    let secs = env::var("DSH_READY_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(300);
-    Duration::from_secs(secs)
-}
+// ---------------------------------------------------------------------------
+// small helpers
+// ---------------------------------------------------------------------------
 
 fn url_for(port: u16) -> String {
     format!("http://127.0.0.1:{port}/")
@@ -258,6 +452,16 @@ struct SingleInstance(*mut c_void);
 
 impl SingleInstance {
     fn acquire() -> Option<SingleInstance> {
+        // Regression tests run while a real launcher (and the DSH session it
+        // serves) is already up; without this they would exit silently on the
+        // single-instance lock.
+        if env::var("DSH_SKIP_SINGLE_INSTANCE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            log_msg("single-instance check skipped (DSH_SKIP_SINGLE_INSTANCE)");
+            return Some(SingleInstance(std::ptr::null_mut()));
+        }
         let name = wide("Local\\dsh-launcher-single");
         unsafe {
             let h = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
@@ -363,44 +567,64 @@ fn spawn_hidden(args: &[String]) -> std::io::Result<Child> {
 // server
 // ---------------------------------------------------------------------------
 
+/// One way of starting dsh. Attempts are tried in order and the next one is
+/// used only when the previous exits before becoming ready — that is what makes
+/// the launcher survive a flag being renamed or removed in a DSH release.
+struct LaunchAttempt {
+    label: &'static str,
+    cmdline: String,
+    /// Port the launcher may probe for readiness, when it knows it; `None` when
+    /// dsh picks the port itself and only its printed URL can reveal it.
+    probe_port: Option<u16>,
+}
+
+fn build_attempts(cfg: &LaunchConfig, bind_port: Option<u16>) -> Vec<LaunchAttempt> {
+    if cfg.test_command {
+        return vec![LaunchAttempt {
+            label: "test command",
+            cmdline: cfg.command.clone(),
+            probe_port: bind_port,
+        }];
+    }
+    let extra = if cfg.extra_args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", cfg.extra_args.join(" "))
+    };
+    let port_arg = match bind_port {
+        Some(p) => format!(" --port {p}"),
+        None => " --port 0".to_string(),
+    };
+    vec![
+        LaunchAttempt {
+            label: "command + extra args + port",
+            cmdline: format!("{}{}{}", cfg.command, extra, port_arg),
+            probe_port: bind_port,
+        },
+        LaunchAttempt {
+            label: "command + extra args (no --port)",
+            cmdline: format!("{}{}", cfg.command, extra),
+            probe_port: None,
+        },
+        LaunchAttempt {
+            label: "command only",
+            cmdline: cfg.command.clone(),
+            probe_port: None,
+        },
+    ]
+}
+
 /// Starts the server and also returns the length `server.log` had before the
 /// spawn, so the launch URL can be searched for in this run's output only.
-/// `port` is the port to ask dsh for, or `None` to let the OS pick a free one
-/// (`--port 0`).
-fn start_server(job: Option<&KillJob>, port: Option<u16>) -> std::io::Result<(Child, u64)> {
+fn start_server(job: Option<&KillJob>, cmdline: &str) -> std::io::Result<(Child, u64)> {
     let server_log = server_log_path();
     ensure_dir(server_log.parent().unwrap_or(Path::new(".")));
     let log_from = fs::metadata(&server_log).map(|m| m.len()).unwrap_or(0);
     let out = OpenOptions::new().create(true).append(true).open(&server_log)?;
     let err = out.try_clone()?;
 
-    let mut args: Vec<String> = Vec::new();
-    if let Ok(extra) = env::var("DSH_SERVER_EXTRA") {
-        if !extra.trim().is_empty() {
-            log_msg(&format!("[test] launching custom server: {extra}"));
-            args.push("/C".to_string());
-            args.push(extra);
-        }
-    }
-    if args.is_empty() {
-        // The exact command the user requested; --yes pre-answers npx's
-        // interactive install prompt so a console-less run never hangs.
-        // --no-open stops `dsh web` from ALSO opening the default browser
-        // itself (its openBrowser defaults to true), which would produce a
-        // second window on top of the one this launcher opens.
-        args = ["/C", "npx", "--yes", "@deepseek-ai/dsh", "web", "--no-open"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        // Ask for the port explicitly: the port the launcher probes (and the one
-        // the browser is sent to) must be the one dsh actually binds. Without
-        // this, DSH_PORT only moved the probe and not the server.
-        args.push("--port".to_string());
-        args.push(port.map_or_else(|| "0".to_string(), |p| p.to_string()));
-    }
-
     let mut cmd = Command::new("cmd.exe");
-    cmd.args(&args);
+    cmd.args(["/C", cmdline]);
     cmd.current_dir(
         env::var_os("USERPROFILE")
             .map(PathBuf::from)
@@ -410,7 +634,7 @@ fn start_server(job: Option<&KillJob>, port: Option<u16>) -> std::io::Result<(Ch
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    log_msg(&format!("server command: cmd {}", args.join(" ")));
+    log_msg(&format!("server command: cmd /C {cmdline}"));
 
     let child = cmd.spawn()?;
     log_msg(&format!("server child spawned (pid {}), waiting for the port", child.id()));
@@ -421,30 +645,50 @@ fn start_server(job: Option<&KillJob>, port: Option<u16>) -> std::io::Result<(Ch
 }
 
 enum WaitReady {
-    Ready,
+    /// The URL to hand to the browser.
+    Ready(String),
+    /// The port serves something, but it rejects the bare URL and no tokenized
+    /// URL was printed: a DSH release changed its output, so the launcher cannot
+    /// authorize itself.
+    NoLaunchUrl { port: u16 },
     ServerExited(ExitStatus),
     Timeout,
 }
 
 /// `probe_port` is the port that was asked for, or `None` when dsh picks one
 /// itself — in that case its tokenized URL is the only readiness signal.
-fn wait_ready(mut server: Option<&mut Child>, probe_port: Option<u16>, log_from: u64) -> WaitReady {
-    let deadline = Instant::now() + ready_timeout();
+fn wait_ready(
+    mut server: Option<&mut Child>,
+    probe_port: Option<u16>,
+    log_from: u64,
+    cfg: &LaunchConfig,
+) -> WaitReady {
+    let deadline = Instant::now() + cfg.timeout;
     let mut port_open_since: Option<Instant> = None;
     loop {
-        if let Some(url) = find_launch_url(log_from) {
+        if let Some(url) = find_launch_url(log_from, &cfg.url_marker) {
             if url_port(&url).is_none_or(port_open) {
-                return WaitReady::Ready;
+                return WaitReady::Ready(url);
             }
         }
         if let Some(port) = probe_port {
             if port_open(port) {
                 // A dsh without token auth never prints that URL; do not wait
-                // for it forever.
+                // for it forever, but only accept the bare URL when it really is
+                // usable — otherwise the browser would open a 401 page.
                 let since = *port_open_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= LAUNCH_URL_GRACE {
-                    log_msg("no tokenized launch URL in server output; using the bare URL");
-                    return WaitReady::Ready;
+                    match http_status(port) {
+                        Some(200) | Some(303) => {
+                            log_msg("no tokenized launch URL in output; the bare URL is usable, using it");
+                            return WaitReady::Ready(url_for(port));
+                        }
+                        Some(status) => {
+                            log_msg(&format!("no tokenized launch URL in output and the bare URL returned {status}"));
+                            return WaitReady::NoLaunchUrl { port };
+                        }
+                        None => {}
+                    }
                 }
             }
         }
@@ -585,75 +829,152 @@ fn run() -> i32 {
         return 0;
     };
 
-    let wanted_port = port_from_env();
-    // A dsh already listening on the wanted port cannot be reused: every UI
-    // request is authenticated with a token that exists only inside that node
-    // process and is never persisted, so there is no way to drive it. Start our
-    // own dsh web on an OS-picked free port instead, and leave that one alone.
-    let port_busy = port_open(wanted_port);
-    let bind_port = if port_busy { None } else { Some(wanted_port) };
-    let url: String;
-    log_msg(&format!(
-        "port {wanted_port} already in use: {port_busy}{}",
-        if port_busy { " — starting our own dsh web on a free port" } else { "" }
-    ));
+    let cfg = LaunchConfig::load();
 
-    // The job object is an extra safety net for abrupt termination (e.g. the
-    // launcher itself is killed). Normal shutdown always uses taskkill below,
-    // so job creation is best-effort and optional.
-    let job = KillJob::create();
-    let (server_child, server_log_from) = match start_server(job.as_ref(), bind_port) {
-        Ok((c, log_from)) => (c, log_from),
-        Err(e) => {
-            log_msg(&format!("failed to spawn server: {e}"));
-            show_message(
-                "DSH 启动器",
-                &format!(
-                    "无法启动 npx @deepseek-ai/dsh web:\n{e}\n\n请确认已安装 Node.js 并已加入 PATH。\n\n日志:{}\n服务输出:{}\n",
-                    log_path().display(),
-                    server_log_path().display()
-                ),
-            );
-            return 1;
+    // Reuse an existing service only when it needs no token at all (a DSH old
+    // enough not to authenticate). A token-protected one cannot be driven from
+    // outside: its token lives only in that node process.
+    let mut url: Option<String> = None;
+    let mut bind_port: Option<u16> = None;
+    if cfg.port != 0 {
+        match http_status(cfg.port) {
+            Some(200) | Some(303) => {
+                log_msg(&format!(
+                    "port {} already serves the UI without a token; reusing it",
+                    cfg.port
+                ));
+                url = Some(url_for(cfg.port));
+            }
+            Some(status) => {
+                log_msg(&format!(
+                    "port {} is served but requires its own token (HTTP {status}); starting a separate instance",
+                    cfg.port
+                ));
+            }
+            None if port_open(cfg.port) => {
+                log_msg(&format!(
+                    "port {} is open but does not answer HTTP; starting a separate instance",
+                    cfg.port
+                ));
+            }
+            None => {
+                log_msg(&format!("port {} is free; starting dsh web there", cfg.port));
+                bind_port = Some(cfg.port);
+            }
         }
-    };
-    let server_pid = server_child.id();
-    let mut server = Some(server_child);
+    } else {
+        log_msg("configured port is 0; letting dsh pick a free port");
+    }
 
-    match wait_ready(server.as_mut(), bind_port, server_log_from) {
-        WaitReady::Ready => {
-            // The URL carries this process's launch token; without it dsh rejects
-            // the request (401) and the browser shows an error page instead of
-            // the UI.
-            url = find_launch_url(server_log_from).unwrap_or_else(|| url_for(wanted_port));
-            log_msg(&format!("server ready: {url}"));
-        }
-        WaitReady::ServerExited(st) => {
-            log_msg(&format!("server exited early with {st}"));
-            show_message(
-                "DSH 启动器",
-                &format!(
-                    "dsh web 未能启动(进程已退出:{st})。\n\n最近的输出:\n{}\n\n完整日志:{}\n\n建议:打开一个终端手动运行:\nnpx @deepseek-ai/dsh web\n以查看详细错误。",
-                    read_tail(&server_log_path(), 2000),
-                    server_log_path().display()
-                ),
-            );
-            return 1;
-        }
-        WaitReady::Timeout => {
-            log_msg("server did not become ready in time");
-            show_message(
-                "DSH 启动器",
-                &format!(
-                    "等待 dsh web 就绪超时({} 秒)。\n\n最近的输出:\n{}\n\n完整日志:{}\n\n建议:打开一个终端手动运行:\nnpx @deepseek-ai/dsh web\n以查看详细错误。",
-                    ready_timeout().as_secs(),
-                    read_tail(&server_log_path(), 2000),
-                    server_log_path().display()
-                ),
-            );
-            return 1;
+    let mut own_server = false;
+    let mut server: Option<Child> = None;
+    let mut job: Option<KillJob> = None;
+    let mut server_pid: Option<u32> = None;
+
+    if url.is_none() {
+        let attempts = build_attempts(&cfg, bind_port);
+        for (index, attempt) in attempts.iter().enumerate() {
+            let is_last = index + 1 == attempts.len();
+            log_msg(&format!(
+                "launch attempt {}/{} [{}]: {}",
+                index + 1,
+                attempts.len(),
+                attempt.label,
+                attempt.cmdline
+            ));
+
+            // The job object is an extra safety net for abrupt termination (e.g.
+            // the launcher itself is killed). Normal shutdown always uses
+            // taskkill, so job creation is best-effort and optional.
+            let attempt_job = KillJob::create();
+            let (child, log_from) = match start_server(attempt_job.as_ref(), &attempt.cmdline) {
+                Ok(v) => v,
+                Err(e) => {
+                    log_msg(&format!("failed to spawn server: {e}"));
+                    show_message(
+                        "DSH 启动器",
+                        &format!(
+                            "无法启动 DSH 服务:\n{e}\n\n当前命令:{}\n(可在 {} 中修改 command)\n\n请确认已安装 Node.js 并已加入 PATH。\n\n日志:{}\n服务输出:{}\n",
+                            attempt.cmdline,
+                            cfg.path.display(),
+                            log_path().display(),
+                            server_log_path().display()
+                        ),
+                    );
+                    return 1;
+                }
+            };
+            let pid = child.id();
+            let mut child = child;
+
+            match wait_ready(Some(&mut child), attempt.probe_port, log_from, &cfg) {
+                WaitReady::Ready(found) => {
+                    log_msg(&format!("server ready: {found}"));
+                    url = Some(found);
+                    own_server = true;
+                    server_pid = Some(pid);
+                    job = attempt_job;
+                    server = Some(child);
+                    break;
+                }
+                WaitReady::NoLaunchUrl { port } => {
+                    log_msg(&format!("port {port} rejects the bare URL and no launch URL was printed"));
+                    kill_tree(pid);
+                    show_message(
+                        "DSH 启动器",
+                        &format!(
+                            "dsh web 已在端口 {port} 上运行,但启动器无法取得它的访问令牌:本次输出里没有找到带 token 的地址。\n\n这通常意味着 DSH 更新后改变了输出格式。请检查配置文件的 url_marker 设置(当前为 {:?}):\n{}\n\n服务输出:\n{}\n\n日志:{}",
+                            cfg.url_marker,
+                            cfg.path.display(),
+                            read_tail(&server_log_path(), 2000),
+                            log_path().display()
+                        ),
+                    );
+                    return 1;
+                }
+                WaitReady::ServerExited(st) => {
+                    log_msg(&format!("attempt failed: server exited early with {st}"));
+                    kill_tree(pid);
+                    if is_last {
+                        show_message(
+                            "DSH 启动器",
+                            &format!(
+                                "dsh web 未能启动(进程已退出:{st})。\n\n最后的命令:{}\n(可在 {} 中修改 command / extra_args)\n\n最近的输出:\n{}\n\n完整日志:{}\n\n建议:打开一个终端手动运行以查看详细错误。",
+                                attempt.cmdline,
+                                cfg.path.display(),
+                                read_tail(&server_log_path(), 2000),
+                                server_log_path().display()
+                            ),
+                        );
+                        return 1;
+                    }
+                    log_msg("retrying with a simpler command line");
+                }
+                WaitReady::Timeout => {
+                    log_msg("server did not become ready in time");
+                    kill_tree(pid);
+                    show_message(
+                        "DSH 启动器",
+                        &format!(
+                            "等待 dsh web 就绪超时({} 秒)。\n\n命令:{}\n\n最近的输出:\n{}\n\n完整日志:{}\n\n建议:打开一个终端手动运行以查看详细错误;若 DSH 更新后启动方式有变,可在 {} 中调整 command / extra_args / timeout_secs。",
+                            cfg.timeout.as_secs(),
+                            attempt.cmdline,
+                            read_tail(&server_log_path(), 2000),
+                            server_log_path().display(),
+                            cfg.path.display()
+                        ),
+                    );
+                    return 1;
+                }
+            }
         }
     }
+
+    let Some(url) = url else {
+        // The attempt loop always reports before exhausting its list.
+        log_msg("no launch URL could be obtained");
+        return 1;
+    };
 
     let profile = fresh_profile_dir();
     let mut browser = match spawn_browser(&url, &profile) {
@@ -691,12 +1012,18 @@ fn run() -> i32 {
         }
     }
 
-    log_msg(&format!("stopping server tree (pid {server_pid})"));
-    kill_tree(server_pid);
-    drop(job); // kill-on-close terminates anything still in the job
-    if let Some(mut s) = server {
-        let _ = s.kill();
-        let _ = s.wait();
+    if own_server {
+        if let Some(pid) = server_pid {
+            log_msg(&format!("stopping server tree (pid {pid})"));
+            kill_tree(pid);
+        }
+        drop(job); // kill-on-close terminates anything still in the job
+        if let Some(mut s) = server {
+            let _ = s.kill();
+            let _ = s.wait();
+        }
+    } else {
+        log_msg("the reused service is left untouched");
     }
 
     cleanup_profile(&profile);

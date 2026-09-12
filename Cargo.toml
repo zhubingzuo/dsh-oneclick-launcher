@@ -1,8 +1,8 @@
 [package]
 name = "dsh-launcher"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
-description = "One-click launcher for DeepSeek Harness: starts `npx @deepseek-ai/dsh web`, opens a clean Chrome window at http://127.0.0.1:3080/, no console window."
+description = "One-click launcher for DeepSeek Harness: starts the DSH web UI with no console window, opens one clean Chrome window, and stops the service when that window closes. Survives DSH updates via an editable config file."
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/zhubingzuo/dsh-oneclick-launcher"

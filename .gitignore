@@ -4,6 +4,12 @@
 # Convenience copy of the release binary (kept locally for double-click use)
 /dsh-launcher.exe
 
+# Auto-generated config (created next to the exe on first run)
+dsh-launcher.conf
+
+# Regression test scratch space
+/.testdata/
+
 # Editor / OS noise
 .vscode/
 .idea/
