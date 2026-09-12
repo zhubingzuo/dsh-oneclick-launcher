@@ -310,11 +310,13 @@ url_marker = dsh web:
 # How long to wait for the server to become ready, in seconds.
 timeout_secs = 300
 
-# Window style. app = a Chrome app window: no address bar, no tab strip, so the
-# blue Install chip that Chrome offers for the DSH page (it ships a web app
-# manifest) cannot appear. normal = an ordinary Chrome window; Chrome has no
-# supported way to hide that chip there.
-window_mode = app
+# Window style.
+#   normal = an ordinary Chrome window: address bar and tab strip (default).
+#            Chrome shows its blue Install chip for the DSH page there, and no
+#            supported switch removes it.
+#   app    = a Chrome app window: no address bar, no tab strip, so the Install
+#            chip cannot appear — at the cost of the address bar.
+window_mode = normal
 ";
 
 struct LaunchConfig {
@@ -340,7 +342,7 @@ impl Default for LaunchConfig {
             ui_marker: "DeepSeek Harness".to_string(),
             url_marker: "dsh web:".to_string(),
             timeout: Duration::from_secs(300),
-            app_window: true,
+            app_window: false,
             test_command: false,
             path: PathBuf::new(),
         }

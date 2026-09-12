@@ -65,10 +65,13 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/regression.ps1
      了**(Preferences 里确实存在)但地址栏图标依旧;随后用"只截窗口顶栏 + 逐行统计蓝像素"的方式实测,
      `--disable-features=WebAppInstallation` 与基线**逐行完全一致**(毫无效果)。教训:预置偏好类改动
      必须用**用户可见的结果**验证,不能只看键是否被保留。
-   - 最终方案(1.4.0):`window_mode`(默认 `app`)→ Chrome 应用窗口(`--app=<url>`),没有地址栏/标签栏,
-     图标无从出现(实测启动器传给 Chrome 的命令行确为 `--app=…`,关窗后服务正常停止)。
-     `window_mode = normal` 保留地址栏,但"安装"图标会回来——Chrome 没有受支持的开关能去掉它。
+   - 最终方案:`window_mode` 可配置。**1.4.2 起默认 `normal`**(普通窗口:有地址栏/标签栏,Chrome 的
+     "安装"芯片随之存在),因为用户明确**需要地址栏**;`app`(`--app=<url>`:无地址栏/标签栏,图标无从出现)
+     保留为可选。补充证伪:`WebAppInstallationPromo`、`DesktopPWAInstallPromotionML`、`PwaInstall`
+     及其组合经实测均无法移除该芯片 ⇒ **保留地址栏就必然有那个图标**。
    - 已移除失效的 `seed_chrome_prefs` / `block_web_app_install`;**没有**改 DSH 的前端文件。
+   - 踩过的坑:配置文件读取的是 **exe 同目录**那一份(`dsh-launcher.conf`);曾误改项目目录内的同名文件,
+     用户没生效。改配置前先确认 exe 的实际位置。
 ## 下一步 TODO
 
 1. 关掉正在运行的实例后,**手动**把 `target\release\dsh-launcher.exe` 覆盖到仓库根目录的便捷副本
